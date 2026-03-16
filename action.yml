@@ -1,0 +1,59 @@
+name: Sync Buildkite Pipelines
+description: >
+  Reconciles Buildkite pipelines from .buildkite/*.yml files in the calling repo.
+  Creates or updates each pipeline's bootstrap step and GitHub webhook.
+
+inputs:
+  org:
+    description: Buildkite organization slug
+    required: false
+    default: chalk
+  cluster-id:
+    description: Buildkite cluster ID
+    required: true
+  dir:
+    description: Directory containing pipeline YAML files
+    required: false
+    default: .buildkite
+  default-branch:
+    description: Default branch for created pipelines
+    required: false
+    default: main
+  team-uuid:
+    description: Buildkite team UUID to assign newly created pipelines to
+    required: false
+    default: ''
+  dry-run:
+    description: Print planned actions without making changes
+    required: false
+    default: 'false'
+
+# BUILDKITE_API_TOKEN is passed via env: in the calling workflow.
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.x'
+        cache-dependency-path: ${{ github.action_path }}/go.sum
+
+    - name: Sync Buildkite pipelines
+      shell: bash
+      run: |
+        ARGS=(
+          -work-dir "$PWD"
+          -dir "${{ inputs.dir }}"
+          -org "${{ inputs.org }}"
+          -cluster-id "${{ inputs.cluster-id }}"
+          -default-branch "${{ inputs.default-branch }}"
+          -repo "${{ github.repository }}"
+        )
+        if [[ -n "${{ inputs.team-uuid }}" ]]; then
+          ARGS+=(-team-uuid "${{ inputs.team-uuid }}")
+        fi
+        if [[ "${{ inputs.dry-run }}" == "true" ]]; then
+          ARGS+=(-dry-run)
+        fi
+        cd "${{ github.action_path }}"
+        go run main.go "${ARGS[@]}"
