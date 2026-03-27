@@ -329,10 +329,20 @@ func discoverPipelines(dir string) ([]pipelineEntry, error) {
 	return pipelines, nil
 }
 
-// bootstrapConfig returns the minimal pipeline configuration that uploads the real
-// pipeline steps from the repo at build time (Buildkite's dynamic pipelines pattern).
+// bootstrapConfig returns a minimal pipeline configuration that uploads the real
+// pipeline steps from the repo at build time.
+//
+// The upload command gracefully skips on PR branches when the pipeline file doesn't
+// exist — this handles the case where a pipeline was created on another branch that
+// the current PR branch hasn't merged yet. On non-PR builds (e.g. main) a missing
+// file is still an error.
 func bootstrapConfig(dir, filename, fileURL string) string {
-	return fmt.Sprintf("steps:\n  - label: \":pipeline: Upload pipeline — %s\"\n    command: \"buildkite-agent pipeline upload %s/%s\"\n", fileURL, dir, filename)
+	path := dir + "/" + filename
+	cmd := fmt.Sprintf(
+		`if [ -f %s ]; then buildkite-agent pipeline upload %s; elif [ "${BUILDKITE_PULL_REQUEST}" != "false" ]; then echo "Pipeline file %s not found on this PR branch, skipping."; else echo "Pipeline file %s not found!" && exit 1; fi`,
+		path, path, path, path,
+	)
+	return fmt.Sprintf("steps:\n  - label: \":pipeline: Upload pipeline — %s\"\n    command: %q\n", fileURL, cmd)
 }
 
 func buildProviderSettings(on *TriggerConfig) *BuildkiteProviderSettings {

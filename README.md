@@ -81,7 +81,19 @@ steps:
     command: ./scripts/deploy.sh
 ```
 
-Files without an `on:` block are skipped.
+**API-only / managed pipeline (no automatic triggers):**
+```yaml
+# .buildkite/nightly.yml
+on: {}
+
+steps:
+  - label: ":night_with_stars: Nightly job"
+    command: ./scripts/nightly.sh
+```
+
+Using `on: {}` puts the pipeline under sync action management (creates/updates it) but configures no GitHub triggers — the pipeline will only run when triggered manually or via the Buildkite API.
+
+Files without an `on:` block are skipped entirely and not managed by the action.
 
 ### Trigger options
 
