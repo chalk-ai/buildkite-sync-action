@@ -105,6 +105,29 @@ Files without an `on:` block are skipped entirely and not managed by the action.
 | `tag` | `conditional_filter` | Buildkite condition expression (e.g. `build.tag =~ /^v\d+\.\d+/`) |
 | `push` | `branches` | List of branches that trigger builds |
 
+### Build behavior
+
+An optional top-level `builds:` block controls intermediate build handling. By default, queued and running builds are cancelled/skipped when a new commit is pushed, except on `main` and `dev`.
+
+```yaml
+# .buildkite/pr.yml
+on:
+  pull_request: {}
+
+builds:
+  skip_intermediate: true        # default: true — skip queued builds on new push
+  cancel_intermediate: true      # default: true — cancel running builds on new push
+  branch_filter: "!main !dev"    # default: "!main !dev" — branches excluded from above
+```
+
+To disable this behaviour for a pipeline:
+
+```yaml
+builds:
+  skip_intermediate: false
+  cancel_intermediate: false
+```
+
 ### Pipeline naming
 
 Pipelines are named `{repo-name}-{filename-without-ext}`. For example, `.buildkite/pr.yml` in `chalk-ai/chalk-router` becomes `chalk-router-pr`.

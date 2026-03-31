@@ -30,7 +30,15 @@ import (
 //	  - label: ":go: tests"
 //	    command: go test ./...
 type PipelineFile struct {
-	On *TriggerConfig `yaml:"on"`
+	On     *TriggerConfig `yaml:"on"`
+	Builds *BuildsConfig  `yaml:"builds"`
+}
+
+// BuildsConfig holds pipeline-level build behavior overrides.
+type BuildsConfig struct {
+	SkipIntermediate   *bool  `yaml:"skip_intermediate"`
+	CancelIntermediate *bool  `yaml:"cancel_intermediate"`
+	BranchFilter       string `yaml:"branch_filter"`
 }
 
 type TriggerConfig struct {
@@ -106,22 +114,30 @@ type BuildkiteProviderSettings struct {
 }
 
 type BuildkiteCreatePipelineReq struct {
-	Name                string                     `json:"name"`
-	Description         string                     `json:"description,omitempty"`
-	Repository          string                     `json:"repository"`
-	DefaultBranch       string                     `json:"default_branch"`
-	Configuration       string                     `json:"configuration"`
-	BranchConfiguration string                     `json:"branch_configuration,omitempty"`
-	ClusterID           string                     `json:"cluster_id,omitempty"`
-	TeamUUIDs           []string                   `json:"team_uuids,omitempty"`
-	ProviderSettings    *BuildkiteProviderSettings `json:"provider_settings,omitempty"`
+	Name                            string                     `json:"name"`
+	Description                     string                     `json:"description,omitempty"`
+	Repository                      string                     `json:"repository"`
+	DefaultBranch                   string                     `json:"default_branch"`
+	Configuration                   string                     `json:"configuration"`
+	BranchConfiguration             string                     `json:"branch_configuration,omitempty"`
+	ClusterID                       string                     `json:"cluster_id,omitempty"`
+	TeamUUIDs                       []string                   `json:"team_uuids,omitempty"`
+	ProviderSettings                *BuildkiteProviderSettings `json:"provider_settings,omitempty"`
+	SkipQueuedBranchBuilds          bool                       `json:"skip_queued_branch_builds"`
+	SkipQueuedBranchBuildsFilter    string                     `json:"skip_queued_branch_builds_filter,omitempty"`
+	CancelRunningBranchBuilds       bool                       `json:"cancel_running_branch_builds"`
+	CancelRunningBranchBuildsFilter string                     `json:"cancel_running_branch_builds_filter,omitempty"`
 }
 
 type BuildkiteUpdatePipelineReq struct {
-	Description         string                     `json:"description,omitempty"`
-	Configuration       string                     `json:"configuration,omitempty"`
-	BranchConfiguration string                     `json:"branch_configuration,omitempty"`
-	ProviderSettings    *BuildkiteProviderSettings `json:"provider_settings,omitempty"`
+	Description                     string                     `json:"description,omitempty"`
+	Configuration                   string                     `json:"configuration,omitempty"`
+	BranchConfiguration             string                     `json:"branch_configuration,omitempty"`
+	ProviderSettings                *BuildkiteProviderSettings `json:"provider_settings,omitempty"`
+	SkipQueuedBranchBuilds          bool                       `json:"skip_queued_branch_builds"`
+	SkipQueuedBranchBuildsFilter    string                     `json:"skip_queued_branch_builds_filter,omitempty"`
+	CancelRunningBranchBuilds       bool                       `json:"cancel_running_branch_builds"`
+	CancelRunningBranchBuildsFilter string                     `json:"cancel_running_branch_builds_filter,omitempty"`
 }
 
 type BuildkitePipelineResp struct {
@@ -239,7 +255,7 @@ func run(ctx context.Context, cfg Config) error {
 		fileURL := fmt.Sprintf("https://github.com/%s/%s/blob/%s/%s/%s", cfg.GitHubOwner, cfg.GitHubRepo, cfg.DefaultBranch, cfg.PipelinesDir, filename)
 		description := fmt.Sprintf("%s/%s %s: %s", cfg.GitHubOwner, cfg.GitHubRepo, filename, triggerNames(pf.On))
 		bootstrap := bootstrapConfig(cfg.PipelinesDir, filename, fileURL)
-		providerSettings := buildProviderSettings(pf.On)
+		pipelineCfg := buildPipelineConfig(pf)
 		branchConfig := buildBranchConfiguration(pf.On)
 
 		log.Printf("  [sync] %s -> pipeline %q (slug=%s)", filename, pipelineName, slug)
@@ -253,10 +269,13 @@ func run(ctx context.Context, cfg Config) error {
 			log.Printf("    [dry-run] would create/update pipeline %q", pipelineName)
 			log.Printf("    [dry-run] description: %s", description)
 			log.Printf("    [dry-run] provider_settings: build_branches=%v build_pull_requests=%v build_tags=%v",
-				providerSettings.BuildBranches, providerSettings.BuildPullRequests, providerSettings.BuildTags)
-			if providerSettings.FilterEnabled {
-				log.Printf("    [dry-run] filter_condition: %s", providerSettings.FilterCondition)
+				pipelineCfg.providerSettings.BuildBranches, pipelineCfg.providerSettings.BuildPullRequests, pipelineCfg.providerSettings.BuildTags)
+			if pipelineCfg.providerSettings.FilterEnabled {
+				log.Printf("    [dry-run] filter_condition: %s", pipelineCfg.providerSettings.FilterCondition)
 			}
+			log.Printf("    [dry-run] skip_queued_branch_builds=%v (filter=%q) cancel_running_branch_builds=%v (filter=%q)",
+				pipelineCfg.skipQueuedBuilds, pipelineCfg.skipQueuedBuildsFilter,
+				pipelineCfg.cancelRunningBuilds, pipelineCfg.cancelRunningBuildsFilter)
 			log.Printf("    [dry-run] bootstrap configuration:\n%s", bootstrap)
 			continue
 		}
@@ -265,13 +284,13 @@ func run(ctx context.Context, cfg Config) error {
 		var pipeline BuildkitePipelineResp
 		if err == nil {
 			log.Printf("    Updating existing pipeline %q", slug)
-			pipeline, err = updateBuildkitePipeline(ctx, cfg, slug, description, bootstrap, branchConfig, providerSettings)
+			pipeline, err = updateBuildkitePipeline(ctx, cfg, slug, description, bootstrap, branchConfig, pipelineCfg)
 			if err != nil {
 				return fmt.Errorf("updating pipeline %s: %w", filename, err)
 			}
 		} else if errors.Is(err, errNotFound) {
 			log.Printf("    Creating new pipeline %q", pipelineName)
-			pipeline, err = createBuildkitePipeline(ctx, cfg, pipelineName, description, bootstrap, branchConfig, providerSettings)
+			pipeline, err = createBuildkitePipeline(ctx, cfg, pipelineName, description, bootstrap, branchConfig, pipelineCfg)
 			if err != nil {
 				return fmt.Errorf("creating pipeline %s: %w", filename, err)
 			}
@@ -345,7 +364,18 @@ func bootstrapConfig(dir, filename, fileURL string) string {
 	return fmt.Sprintf("steps:\n  - label: \":pipeline: Upload pipeline — %s\"\n    command: %q\n", fileURL, cmd)
 }
 
-func buildProviderSettings(on *TriggerConfig) *BuildkiteProviderSettings {
+const defaultIntermediateBuildsBranchFilter = "!main !dev"
+
+type pipelineConfig struct {
+	providerSettings          *BuildkiteProviderSettings
+	skipQueuedBuilds          bool
+	skipQueuedBuildsFilter    string
+	cancelRunningBuilds       bool
+	cancelRunningBuildsFilter string
+}
+
+func buildPipelineConfig(pf *PipelineFile) pipelineConfig {
+	on := pf.On
 	ps := &BuildkiteProviderSettings{
 		TriggerMode:                    "code",
 		PublishCommitStatus:            true,
@@ -377,7 +407,34 @@ func buildProviderSettings(on *TriggerConfig) *BuildkiteProviderSettings {
 		}
 	}
 
-	return ps
+	// Enable skip/cancel of intermediate builds by default, excluding protected branches.
+	skipQueued := true
+	cancelRunning := true
+	branchFilter := defaultIntermediateBuildsBranchFilter
+	if pf.Builds != nil {
+		if pf.Builds.SkipIntermediate != nil {
+			skipQueued = *pf.Builds.SkipIntermediate
+		}
+		if pf.Builds.CancelIntermediate != nil {
+			cancelRunning = *pf.Builds.CancelIntermediate
+		}
+		if pf.Builds.BranchFilter != "" {
+			branchFilter = pf.Builds.BranchFilter
+		}
+	}
+
+	pc := pipelineConfig{
+		providerSettings:    ps,
+		skipQueuedBuilds:    skipQueued,
+		cancelRunningBuilds: cancelRunning,
+	}
+	if skipQueued {
+		pc.skipQueuedBuildsFilter = branchFilter
+	}
+	if cancelRunning {
+		pc.cancelRunningBuildsFilter = branchFilter
+	}
+	return pc
 }
 
 // buildBranchConfiguration returns the top-level branch_configuration glob for the pipeline.
@@ -422,16 +479,20 @@ var errNotFound = errors.New("not found")
 
 // --- Buildkite API ---
 
-func createBuildkitePipeline(ctx context.Context, cfg Config, name, description, configuration, branchConfiguration string, ps *BuildkiteProviderSettings) (BuildkitePipelineResp, error) {
+func createBuildkitePipeline(ctx context.Context, cfg Config, name, description, configuration, branchConfiguration string, pc pipelineConfig) (BuildkitePipelineResp, error) {
 	payload := BuildkiteCreatePipelineReq{
-		Name:                name,
-		Description:         description,
-		Repository:          cfg.RepoURL,
-		DefaultBranch:       cfg.DefaultBranch,
-		Configuration:       configuration,
-		BranchConfiguration: branchConfiguration,
-		ClusterID:           cfg.ClusterID,
-		ProviderSettings:    ps,
+		Name:                            name,
+		Description:                     description,
+		Repository:                      cfg.RepoURL,
+		DefaultBranch:                   cfg.DefaultBranch,
+		Configuration:                   configuration,
+		BranchConfiguration:             branchConfiguration,
+		ClusterID:                       cfg.ClusterID,
+		ProviderSettings:                pc.providerSettings,
+		SkipQueuedBranchBuilds:          pc.skipQueuedBuilds,
+		SkipQueuedBranchBuildsFilter:    pc.skipQueuedBuildsFilter,
+		CancelRunningBranchBuilds:       pc.cancelRunningBuilds,
+		CancelRunningBranchBuildsFilter: pc.cancelRunningBuildsFilter,
 	}
 	if cfg.TeamUUID != "" {
 		payload.TeamUUIDs = []string{cfg.TeamUUID}
@@ -461,12 +522,16 @@ func createBuildkitePipeline(ctx context.Context, cfg Config, name, description,
 	return pipeline, nil
 }
 
-func updateBuildkitePipeline(ctx context.Context, cfg Config, slug, description, configuration, branchConfiguration string, ps *BuildkiteProviderSettings) (BuildkitePipelineResp, error) {
+func updateBuildkitePipeline(ctx context.Context, cfg Config, slug, description, configuration, branchConfiguration string, pc pipelineConfig) (BuildkitePipelineResp, error) {
 	payload := BuildkiteUpdatePipelineReq{
-		Description:         description,
-		Configuration:       configuration,
-		BranchConfiguration: branchConfiguration,
-		ProviderSettings:    ps,
+		Description:                     description,
+		Configuration:                   configuration,
+		BranchConfiguration:             branchConfiguration,
+		ProviderSettings:                pc.providerSettings,
+		SkipQueuedBranchBuilds:          pc.skipQueuedBuilds,
+		SkipQueuedBranchBuildsFilter:    pc.skipQueuedBuildsFilter,
+		CancelRunningBranchBuilds:       pc.cancelRunningBuilds,
+		CancelRunningBranchBuildsFilter: pc.cancelRunningBuildsFilter,
 	}
 
 	body, _ := json.Marshal(payload)
