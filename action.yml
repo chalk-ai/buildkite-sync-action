@@ -35,8 +35,20 @@ runs:
   steps:
     - uses: actions/setup-go@v5
       with:
-        go-version: '1.x'
-        cache-dependency-path: ${{ github.action_path }}/go.sum
+        go-version-file: ${{ github.action_path }}/go.mod
+        cache: false
+
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/go/pkg/mod
+          ~/.cache/go-build
+        key: ${{ runner.os }}-go-bk-sync-${{ hashFiles(format('{0}/go.sum', github.action_path)) }}
+        restore-keys: ${{ runner.os }}-go-bk-sync-
+
+    - name: Build
+      shell: bash
+      run: cd "${{ github.action_path }}" && go build -o sync-tool .
 
     - name: Sync Buildkite pipelines
       shell: bash
@@ -55,5 +67,4 @@ runs:
         if [[ "${{ inputs.dry-run }}" == "true" ]]; then
           ARGS+=(-dry-run)
         fi
-        cd "${{ github.action_path }}"
-        go run main.go "${ARGS[@]}"
+        "${{ github.action_path }}/sync-tool" "${ARGS[@]}"
