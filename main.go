@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 )
@@ -240,78 +241,101 @@ func run(ctx context.Context, cfg Config) error {
 	log.Printf("Found %d pipeline file(s) in %s", len(pipelines), cfg.PipelinesDir)
 	log.Printf("Target: %s/%s (org: %s, prefix: %q)", cfg.GitHubOwner, cfg.GitHubRepo, cfg.BuildkiteOrg, cfg.PipelinePrefix)
 
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		errs []error
+	)
 	for _, entry := range pipelines {
-		pf := entry.File
-		filename := entry.Filename
-		name := strings.TrimSuffix(strings.TrimSuffix(filename, ".yaml"), ".yml")
-
-		if pf.On == nil {
-			log.Printf("  [skip] %s: no 'on' block", filename)
-			continue
-		}
-
-		pipelineName := cfg.PipelinePrefix + name
-		slug := toSlug(pipelineName)
-		fileURL := fmt.Sprintf("https://github.com/%s/%s/blob/%s/%s/%s", cfg.GitHubOwner, cfg.GitHubRepo, cfg.DefaultBranch, cfg.PipelinesDir, filename)
-		description := fmt.Sprintf("%s/%s %s: %s", cfg.GitHubOwner, cfg.GitHubRepo, filename, triggerNames(pf.On))
-		bootstrap := bootstrapConfig(cfg.PipelinesDir, filename, fileURL)
-		pipelineCfg := buildPipelineConfig(pf)
-		branchConfig := buildBranchConfiguration(pf.On)
-
-		log.Printf("  [sync] %s -> pipeline %q (slug=%s)", filename, pipelineName, slug)
-		if pf.On.Push == nil && pf.On.PR == nil && pf.On.Tag == nil {
-			log.Printf("         no GitHub triggers — pipeline will only be triggered via API")
-		} else {
-			log.Printf("         push=%v pr=%v tag=%v", pf.On.Push != nil, pf.On.PR != nil, pf.On.Tag != nil)
-		}
-
-		if cfg.DryRun {
-			log.Printf("    [dry-run] would create/update pipeline %q", pipelineName)
-			log.Printf("    [dry-run] description: %s", description)
-			log.Printf("    [dry-run] provider_settings: build_branches=%v build_pull_requests=%v build_tags=%v",
-				pipelineCfg.providerSettings.BuildBranches, pipelineCfg.providerSettings.BuildPullRequests, pipelineCfg.providerSettings.BuildTags)
-			if pipelineCfg.providerSettings.FilterEnabled {
-				log.Printf("    [dry-run] filter_condition: %s", pipelineCfg.providerSettings.FilterCondition)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := syncPipeline(ctx, cfg, entry); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
 			}
-			log.Printf("    [dry-run] skip_queued_branch_builds=%v (filter=%q) cancel_running_branch_builds=%v (filter=%q)",
-				pipelineCfg.skipQueuedBuilds, pipelineCfg.skipQueuedBuildsFilter,
-				pipelineCfg.cancelRunningBuilds, pipelineCfg.cancelRunningBuildsFilter)
-			log.Printf("    [dry-run] bootstrap configuration:\n%s", bootstrap)
-			continue
-		}
+		}()
+	}
+	wg.Wait()
 
-		_, err := getBuildkitePipeline(ctx, cfg, slug)
-		var pipeline BuildkitePipelineResp
-		if err == nil {
-			log.Printf("    Updating existing pipeline %q", slug)
-			pipeline, err = updateBuildkitePipeline(ctx, cfg, slug, description, bootstrap, branchConfig, pipelineCfg)
-			if err != nil {
-				return fmt.Errorf("updating pipeline %s: %w", filename, err)
-			}
-		} else if errors.Is(err, errNotFound) {
-			log.Printf("    Creating new pipeline %q", pipelineName)
-			pipeline, err = createBuildkitePipeline(ctx, cfg, pipelineName, description, bootstrap, branchConfig, pipelineCfg)
-			if err != nil {
-				return fmt.Errorf("creating pipeline %s: %w", filename, err)
-			}
-		} else {
-			return fmt.Errorf("looking up pipeline %s: %w", slug, err)
-		}
-		log.Printf("    Pipeline URL: %s", pipeline.WebURL)
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	log.Println("Done.")
+	return nil
+}
 
-		if pf.On.Push != nil || pf.On.PR != nil || pf.On.Tag != nil {
-			log.Printf("    Registering GitHub webhook via Buildkite...")
-			if err = createBuildkiteWebhook(ctx, cfg, pipeline.Slug); err != nil {
-				log.Printf("    Warning: could not register webhook for %s: %v (webhook may already be registered)", slug, err)
-			} else {
-				log.Printf("    Webhook registered.")
-			}
-		} else {
-			log.Printf("    Skipping webhook registration (no GitHub triggers).")
-		}
+func syncPipeline(ctx context.Context, cfg Config, entry pipelineEntry) error {
+	pf := entry.File
+	filename := entry.Filename
+	name := strings.TrimSuffix(strings.TrimSuffix(filename, ".yaml"), ".yml")
+
+	if pf.On == nil {
+		log.Printf("[%s] skip: no 'on' block", filename)
+		return nil
 	}
 
-	log.Println("Done.")
+	pipelineName := cfg.PipelinePrefix + name
+	slug := toSlug(pipelineName)
+	logger := log.New(log.Writer(), fmt.Sprintf("[%s] ", slug), 0)
+
+	fileURL := fmt.Sprintf("https://github.com/%s/%s/blob/%s/%s/%s", cfg.GitHubOwner, cfg.GitHubRepo, cfg.DefaultBranch, cfg.PipelinesDir, filename)
+	description := fmt.Sprintf("%s/%s %s: %s", cfg.GitHubOwner, cfg.GitHubRepo, filename, triggerNames(pf.On))
+	bootstrap := bootstrapConfig(cfg.PipelinesDir, filename, fileURL)
+	pipelineCfg := buildPipelineConfig(pf)
+	branchConfig := buildBranchConfiguration(pf.On)
+
+	if pf.On.Push == nil && pf.On.PR == nil && pf.On.Tag == nil {
+		logger.Printf("no GitHub triggers — pipeline will only be triggered via API")
+	} else {
+		logger.Printf("push=%v pr=%v tag=%v", pf.On.Push != nil, pf.On.PR != nil, pf.On.Tag != nil)
+	}
+
+	if cfg.DryRun {
+		logger.Printf("[dry-run] would create/update pipeline %q", pipelineName)
+		logger.Printf("[dry-run] description: %s", description)
+		logger.Printf("[dry-run] provider_settings: build_branches=%v build_pull_requests=%v build_tags=%v",
+			pipelineCfg.providerSettings.BuildBranches, pipelineCfg.providerSettings.BuildPullRequests, pipelineCfg.providerSettings.BuildTags)
+		if pipelineCfg.providerSettings.FilterEnabled {
+			logger.Printf("[dry-run] filter_condition: %s", pipelineCfg.providerSettings.FilterCondition)
+		}
+		logger.Printf("[dry-run] skip_queued_branch_builds=%v (filter=%q) cancel_running_branch_builds=%v (filter=%q)",
+			pipelineCfg.skipQueuedBuilds, pipelineCfg.skipQueuedBuildsFilter,
+			pipelineCfg.cancelRunningBuilds, pipelineCfg.cancelRunningBuildsFilter)
+		logger.Printf("[dry-run] bootstrap configuration:\n%s", bootstrap)
+		return nil
+	}
+
+	_, err := getBuildkitePipeline(ctx, cfg, slug)
+	var pipeline BuildkitePipelineResp
+	if err == nil {
+		logger.Printf("updating existing pipeline")
+		pipeline, err = updateBuildkitePipeline(ctx, cfg, slug, description, bootstrap, branchConfig, pipelineCfg)
+		if err != nil {
+			return fmt.Errorf("updating pipeline %s: %w", filename, err)
+		}
+	} else if errors.Is(err, errNotFound) {
+		logger.Printf("creating new pipeline %q", pipelineName)
+		pipeline, err = createBuildkitePipeline(ctx, cfg, pipelineName, description, bootstrap, branchConfig, pipelineCfg)
+		if err != nil {
+			return fmt.Errorf("creating pipeline %s: %w", filename, err)
+		}
+	} else {
+		return fmt.Errorf("looking up pipeline %s: %w", slug, err)
+	}
+	logger.Printf("URL: %s", pipeline.WebURL)
+
+	if pf.On.Push != nil || pf.On.PR != nil || pf.On.Tag != nil {
+		logger.Printf("registering GitHub webhook...")
+		if err = createBuildkiteWebhook(ctx, cfg, pipeline.Slug); err != nil {
+			logger.Printf("warning: could not register webhook: %v (may already be registered)", err)
+		} else {
+			logger.Printf("webhook registered")
+		}
+	} else {
+		logger.Printf("skipping webhook registration (no GitHub triggers)")
+	}
 	return nil
 }
 
