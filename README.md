@@ -128,6 +128,21 @@ builds:
   cancel_intermediate: false
 ```
 
+#### Gating the upload step
+
+`skip_intermediate` only skips builds that are still in the `scheduled`/`creating` state. The generated upload step is the build's first job, so an agent normally starts it immediately and the build flips to `running` — at which point it can no longer be skipped. To keep newer builds skippable, gate the upload step on a concurrency group (typically the same group used by the real work step the upload publishes):
+
+```yaml
+builds:
+  skip_intermediate: true
+  cancel_intermediate: false       # let the running build finish
+  branch_filter: "dev"
+  concurrency: 1                   # default: 1 when concurrency_group is set
+  concurrency_group: "my-pipeline/serialized"
+```
+
+With this, a newer build's upload waits in the concurrency queue behind the active build, so the build stays `scheduled` and `skip_intermediate` keeps only the most recent queued build. Combined with `cancel_intermediate: false`, the oldest running build finishes while at most one newer build waits.
+
 ### Pipeline naming
 
 Pipelines are named `{repo-name}-{filename-without-ext}`. For example, `.buildkite/pr.yml` in `chalk-ai/chalk-router` becomes `chalk-router-pr`.

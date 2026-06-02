@@ -40,6 +40,12 @@ type BuildsConfig struct {
 	SkipIntermediate   *bool  `yaml:"skip_intermediate"`
 	CancelIntermediate *bool  `yaml:"cancel_intermediate"`
 	BranchFilter       string `yaml:"branch_filter"`
+	// Concurrency and ConcurrencyGroup gate the generated upload step. When set,
+	// the upload step (the build's first job) waits on the concurrency group
+	// instead of starting immediately, so the build stays scheduled and remains
+	// skippable by skip_intermediate while an earlier build holds the lock.
+	Concurrency      int    `yaml:"concurrency"`
+	ConcurrencyGroup string `yaml:"concurrency_group"`
 }
 
 type TriggerConfig struct {
@@ -282,7 +288,13 @@ func syncPipeline(ctx context.Context, cfg Config, entry pipelineEntry) error {
 
 	fileURL := fmt.Sprintf("https://github.com/%s/%s/blob/%s/%s/%s", cfg.GitHubOwner, cfg.GitHubRepo, cfg.DefaultBranch, cfg.PipelinesDir, filename)
 	description := fmt.Sprintf("%s/%s %s: %s", cfg.GitHubOwner, cfg.GitHubRepo, filename, triggerNames(pf.On))
-	bootstrap := bootstrapConfig(cfg.PipelinesDir, filename, fileURL)
+	var uploadConcurrency int
+	var uploadConcurrencyGroup string
+	if pf.Builds != nil {
+		uploadConcurrency = pf.Builds.Concurrency
+		uploadConcurrencyGroup = pf.Builds.ConcurrencyGroup
+	}
+	bootstrap := bootstrapConfig(cfg.PipelinesDir, filename, fileURL, uploadConcurrency, uploadConcurrencyGroup)
 	pipelineCfg := buildPipelineConfig(pf)
 	branchConfig := buildBranchConfiguration(pf.On)
 
@@ -379,13 +391,24 @@ func discoverPipelines(dir string) ([]pipelineEntry, error) {
 // exist — this handles the case where a pipeline was created on another branch that
 // the current PR branch hasn't merged yet. On non-PR builds (e.g. main) a missing
 // file is still an error.
-func bootstrapConfig(dir, filename, fileURL string) string {
+func bootstrapConfig(dir, filename, fileURL string, concurrency int, concurrencyGroup string) string {
 	path := dir + "/" + filename
 	cmd := fmt.Sprintf(
 		`if [ -f %s ]; then buildkite-agent pipeline upload %s; elif [ "${BUILDKITE_PULL_REQUEST}" != "false" ]; then echo "Pipeline file %s not found on this PR branch, skipping."; else echo "Pipeline file %s not found!" && exit 1; fi`,
 		path, path, path, path,
 	)
-	return fmt.Sprintf("steps:\n  - label: \":pipeline: Upload pipeline — %s\"\n    command: %q\n", fileURL, cmd)
+	var b strings.Builder
+	fmt.Fprintf(&b, "steps:\n  - label: \":pipeline: Upload pipeline — %s\"\n    command: %q\n", fileURL, cmd)
+	// Gate the first job on the concurrency group so a newer build's upload stays
+	// queued (scheduled, not running) behind the active build. An un-gated upload
+	// starts immediately, flips the build to running, and defeats skip_intermediate.
+	if concurrencyGroup != "" {
+		if concurrency < 1 {
+			concurrency = 1
+		}
+		fmt.Fprintf(&b, "    concurrency: %d\n    concurrency_group: %q\n", concurrency, concurrencyGroup)
+	}
+	return b.String()
 }
 
 const defaultIntermediateBuildsBranchFilter = "!main !dev"
