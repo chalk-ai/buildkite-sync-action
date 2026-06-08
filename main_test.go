@@ -60,3 +60,143 @@ func TestBootstrapConfigGroupDefaultsConcurrency(t *testing.T) {
 		t.Errorf("concurrency = %v, want default 1:\n%s", got, cfg)
 	}
 }
+
+func TestToScheduleReqDefaults(t *testing.T) {
+	t.Parallel()
+	s := &ScheduleEntry{Label: "nightly", Cron: "0 2 * * *"}
+	req := toScheduleReq(s, "main")
+
+	if req.Branch != "main" {
+		t.Errorf("Branch = %q, want %q", req.Branch, "main")
+	}
+	if !req.Enabled {
+		t.Errorf("Enabled = false, want true by default")
+	}
+	if req.Cronline != "0 2 * * *" {
+		t.Errorf("Cronline = %q, want %q", req.Cronline, "0 2 * * *")
+	}
+}
+
+func TestToScheduleReqExplicitValues(t *testing.T) {
+	t.Parallel()
+	disabled := false
+	s := &ScheduleEntry{
+		Label:   "weekly",
+		Cron:    "0 9 * * 1",
+		Branch:  "dev",
+		Message: "Weekly run",
+		Env:     map[string]string{"FOO": "bar"},
+		Enabled: &disabled,
+	}
+	req := toScheduleReq(s, "main")
+
+	if req.Branch != "dev" {
+		t.Errorf("Branch = %q, want %q", req.Branch, "dev")
+	}
+	if req.Enabled {
+		t.Errorf("Enabled = true, want false")
+	}
+	if req.Message != "Weekly run" {
+		t.Errorf("Message = %q, want %q", req.Message, "Weekly run")
+	}
+	if req.Env["FOO"] != "bar" {
+		t.Errorf("Env[FOO] = %q, want %q", req.Env["FOO"], "bar")
+	}
+}
+
+func TestScheduleYAMLParsing(t *testing.T) {
+	t.Parallel()
+	input := `
+on:
+  schedule:
+    - label: "Nightly build"
+      cron: "0 2 * * *"
+      branch: main
+      message: "Nightly run"
+      env:
+        FOO: bar
+`
+	var pf PipelineFile
+	if err := yaml.Unmarshal([]byte(input), &pf); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if pf.On == nil {
+		t.Fatal("On is nil")
+	}
+	if len(pf.On.Schedule) != 1 {
+		t.Fatalf("len(Schedule) = %d, want 1", len(pf.On.Schedule))
+	}
+	s := pf.On.Schedule[0]
+	if s.Label != "Nightly build" {
+		t.Errorf("Label = %q, want %q", s.Label, "Nightly build")
+	}
+	if s.Cron != "0 2 * * *" {
+		t.Errorf("Cron = %q, want %q", s.Cron, "0 2 * * *")
+	}
+	if s.Branch != "main" {
+		t.Errorf("Branch = %q, want %q", s.Branch, "main")
+	}
+	if s.Message != "Nightly run" {
+		t.Errorf("Message = %q, want %q", s.Message, "Nightly run")
+	}
+	if s.Env["FOO"] != "bar" {
+		t.Errorf("Env[FOO] = %q, want %q", s.Env["FOO"], "bar")
+	}
+}
+
+func TestScheduleYAMLWithOtherTriggers(t *testing.T) {
+	t.Parallel()
+	input := `
+on:
+  push:
+    branches: [main]
+  schedule:
+    - label: "Nightly"
+      cron: "0 2 * * *"
+    - label: "Weekly"
+      cron: "0 9 * * 1"
+`
+	var pf PipelineFile
+	if err := yaml.Unmarshal([]byte(input), &pf); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if pf.On.Push == nil {
+		t.Fatal("Push is nil")
+	}
+	if len(pf.On.Schedule) != 2 {
+		t.Fatalf("len(Schedule) = %d, want 2", len(pf.On.Schedule))
+	}
+	if pf.On.Schedule[0].Label != "Nightly" {
+		t.Errorf("Schedule[0].Label = %q, want %q", pf.On.Schedule[0].Label, "Nightly")
+	}
+	if pf.On.Schedule[1].Label != "Weekly" {
+		t.Errorf("Schedule[1].Label = %q, want %q", pf.On.Schedule[1].Label, "Weekly")
+	}
+}
+
+func TestScheduleYAMLOptionalFields(t *testing.T) {
+	t.Parallel()
+	input := `
+on:
+  schedule:
+    - label: "Minimal"
+      cron: "0 * * * *"
+`
+	var pf PipelineFile
+	if err := yaml.Unmarshal([]byte(input), &pf); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	s := pf.On.Schedule[0]
+	if s.Branch != "" {
+		t.Errorf("Branch = %q, want empty", s.Branch)
+	}
+	if s.Enabled != nil {
+		t.Errorf("Enabled = %v, want nil", *s.Enabled)
+	}
+	if s.Message != "" {
+		t.Errorf("Message = %q, want empty", s.Message)
+	}
+	if len(s.Env) != 0 {
+		t.Errorf("Env = %v, want empty", s.Env)
+	}
+}

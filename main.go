@@ -49,9 +49,10 @@ type BuildsConfig struct {
 }
 
 type TriggerConfig struct {
-	Push *PushTrigger
-	PR   *PRTrigger
-	Tag  *TagTrigger
+	Push     *PushTrigger
+	PR       *PRTrigger
+	Tag      *TagTrigger
+	Schedule []*ScheduleEntry
 }
 
 type PushTrigger struct {
@@ -66,6 +67,15 @@ type PRTrigger struct {
 type TagTrigger struct {
 	BranchFilter      string `yaml:"branch_filter"`
 	ConditionalFilter string `yaml:"conditional_filter"`
+}
+
+type ScheduleEntry struct {
+	Label   string            `yaml:"label"`
+	Cron    string            `yaml:"cron"`
+	Branch  string            `yaml:"branch"`
+	Message string            `yaml:"message"`
+	Env     map[string]string `yaml:"env"`
+	Enabled *bool             `yaml:"enabled"`
 }
 
 // UnmarshalYAML handles various forms of trigger config:
@@ -96,6 +106,12 @@ func (t *TriggerConfig) UnmarshalYAML(value *yaml.Node) error {
 			t.Tag = &TagTrigger{}
 			if val.Kind == yaml.MappingNode {
 				if err := val.Decode(t.Tag); err != nil {
+					return err
+				}
+			}
+		case "schedule":
+			if val.Kind == yaml.SequenceNode {
+				if err := val.Decode(&t.Schedule); err != nil {
 					return err
 				}
 			}
@@ -299,9 +315,13 @@ func syncPipeline(ctx context.Context, cfg Config, entry pipelineEntry) error {
 	branchConfig := buildBranchConfiguration(pf.On)
 
 	if pf.On.Push == nil && pf.On.PR == nil && pf.On.Tag == nil {
-		logger.Printf("no GitHub triggers — pipeline will only be triggered via API")
+		if len(pf.On.Schedule) > 0 {
+			logger.Printf("no GitHub triggers — schedule only (%d)", len(pf.On.Schedule))
+		} else {
+			logger.Printf("no GitHub triggers — pipeline will only be triggered via API")
+		}
 	} else {
-		logger.Printf("push=%v pr=%v tag=%v", pf.On.Push != nil, pf.On.PR != nil, pf.On.Tag != nil)
+		logger.Printf("push=%v pr=%v tag=%v schedules=%d", pf.On.Push != nil, pf.On.PR != nil, pf.On.Tag != nil, len(pf.On.Schedule))
 	}
 
 	if cfg.DryRun {
@@ -316,6 +336,10 @@ func syncPipeline(ctx context.Context, cfg Config, entry pipelineEntry) error {
 			pipelineCfg.skipQueuedBuilds, pipelineCfg.skipQueuedBuildsFilter,
 			pipelineCfg.cancelRunningBuilds, pipelineCfg.cancelRunningBuildsFilter)
 		logger.Printf("[dry-run] bootstrap configuration:\n%s", bootstrap)
+		for _, s := range pf.On.Schedule {
+			req := toScheduleReq(s, cfg.DefaultBranch)
+			logger.Printf("[dry-run] schedule %q: %s on %s (enabled=%v)", req.Label, req.Cronline, req.Branch, req.Enabled)
+		}
 		return nil
 	}
 
@@ -337,6 +361,10 @@ func syncPipeline(ctx context.Context, cfg Config, entry pipelineEntry) error {
 		return fmt.Errorf("looking up pipeline %s: %w", slug, err)
 	}
 	logger.Printf("URL: %s", pipeline.WebURL)
+
+	if err := syncSchedules(ctx, cfg, logger, pipeline.Slug, pf.On.Schedule, cfg.DefaultBranch); err != nil {
+		return fmt.Errorf("syncing schedules for %s: %w", filename, err)
+	}
 
 	if pf.On.Push != nil || pf.On.PR != nil || pf.On.Tag != nil {
 		logger.Printf("registering GitHub webhook...")
@@ -508,6 +536,9 @@ func triggerNames(on *TriggerConfig) string {
 	if on.Tag != nil {
 		names = append(names, "tag")
 	}
+	if len(on.Schedule) > 0 {
+		names = append(names, fmt.Sprintf("schedule(%d)", len(on.Schedule)))
+	}
 	if len(names) == 0 {
 		return "api"
 	}
@@ -649,6 +680,181 @@ func getBuildkitePipeline(ctx context.Context, cfg Config, slug string) (Buildki
 		return BuildkitePipelineResp{}, err
 	}
 	return pipeline, nil
+}
+
+// --- Buildkite Schedules API ---
+
+type BuildkiteScheduleReq struct {
+	Label   string            `json:"label"`
+	Cronline string           `json:"cronline"`
+	Branch  string            `json:"branch,omitempty"`
+	Message string            `json:"message,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+	Enabled bool              `json:"enabled"`
+}
+
+type BuildkiteScheduleResp struct {
+	ID      string            `json:"id"`
+	Label   string            `json:"label"`
+	Cronline string           `json:"cronline"`
+	Branch  string            `json:"branch"`
+	Message string            `json:"message"`
+	Env     map[string]string `json:"env"`
+	Enabled bool              `json:"enabled"`
+}
+
+func toScheduleReq(s *ScheduleEntry, defaultBranch string) BuildkiteScheduleReq {
+	enabled := true
+	if s.Enabled != nil {
+		enabled = *s.Enabled
+	}
+	branch := s.Branch
+	if branch == "" {
+		branch = defaultBranch
+	}
+	return BuildkiteScheduleReq{
+		Label:   s.Label,
+		Cronline: s.Cron,
+		Branch:  branch,
+		Message: s.Message,
+		Env:     s.Env,
+		Enabled: enabled,
+	}
+}
+
+func syncSchedules(ctx context.Context, cfg Config, logger *log.Logger, slug string, schedules []*ScheduleEntry, defaultBranch string) error {
+	existing, err := listBuildkiteSchedules(ctx, cfg, slug)
+	if err != nil {
+		return fmt.Errorf("listing schedules: %w", err)
+	}
+
+	existingByLabel := make(map[string]BuildkiteScheduleResp, len(existing))
+	for _, s := range existing {
+		existingByLabel[s.Label] = s
+	}
+
+	seen := make(map[string]bool, len(schedules))
+	for _, s := range schedules {
+		seen[s.Label] = true
+		req := toScheduleReq(s, defaultBranch)
+		if ex, ok := existingByLabel[s.Label]; ok {
+			logger.Printf("updating schedule %q", s.Label)
+			if _, err := updateBuildkiteSchedule(ctx, cfg, slug, ex.ID, req); err != nil {
+				return fmt.Errorf("updating schedule %q: %w", s.Label, err)
+			}
+		} else {
+			logger.Printf("creating schedule %q", s.Label)
+			if _, err := createBuildkiteSchedule(ctx, cfg, slug, req); err != nil {
+				return fmt.Errorf("creating schedule %q: %w", s.Label, err)
+			}
+		}
+	}
+
+	for _, ex := range existing {
+		if !seen[ex.Label] {
+			logger.Printf("deleting schedule %q", ex.Label)
+			if err := deleteBuildkiteSchedule(ctx, cfg, slug, ex.ID); err != nil {
+				return fmt.Errorf("deleting schedule %q: %w", ex.Label, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func listBuildkiteSchedules(ctx context.Context, cfg Config, slug string) ([]BuildkiteScheduleResp, error) {
+	url := fmt.Sprintf("https://api.buildkite.com/v2/organizations/%s/pipelines/%s/schedules",
+		cfg.BuildkiteOrg, slug)
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("Buildkite list schedules: %s: %s", resp.Status, body)
+	}
+
+	var schedules []BuildkiteScheduleResp
+	if err := json.Unmarshal(body, &schedules); err != nil {
+		return nil, err
+	}
+	return schedules, nil
+}
+
+func createBuildkiteSchedule(ctx context.Context, cfg Config, slug string, s BuildkiteScheduleReq) (BuildkiteScheduleResp, error) {
+	body, _ := json.Marshal(s)
+	url := fmt.Sprintf("https://api.buildkite.com/v2/organizations/%s/pipelines/%s/schedules",
+		cfg.BuildkiteOrg, slug)
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return BuildkiteScheduleResp{}, err
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != 201 {
+		return BuildkiteScheduleResp{}, fmt.Errorf("Buildkite create schedule: %s: %s", resp.Status, respBody)
+	}
+
+	var schedule BuildkiteScheduleResp
+	if err := json.Unmarshal(respBody, &schedule); err != nil {
+		return BuildkiteScheduleResp{}, err
+	}
+	return schedule, nil
+}
+
+func updateBuildkiteSchedule(ctx context.Context, cfg Config, slug, id string, s BuildkiteScheduleReq) (BuildkiteScheduleResp, error) {
+	body, _ := json.Marshal(s)
+	url := fmt.Sprintf("https://api.buildkite.com/v2/organizations/%s/pipelines/%s/schedules/%s",
+		cfg.BuildkiteOrg, slug, id)
+	req, _ := http.NewRequestWithContext(ctx, "PATCH", url, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return BuildkiteScheduleResp{}, err
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return BuildkiteScheduleResp{}, fmt.Errorf("Buildkite update schedule: %s: %s", resp.Status, respBody)
+	}
+
+	var schedule BuildkiteScheduleResp
+	if err := json.Unmarshal(respBody, &schedule); err != nil {
+		return BuildkiteScheduleResp{}, err
+	}
+	return schedule, nil
+}
+
+func deleteBuildkiteSchedule(ctx context.Context, cfg Config, slug, id string) error {
+	url := fmt.Sprintf("https://api.buildkite.com/v2/organizations/%s/pipelines/%s/schedules/%s",
+		cfg.BuildkiteOrg, slug, id)
+	req, _ := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != 204 {
+		return fmt.Errorf("Buildkite delete schedule: %s: %s", resp.Status, body)
+	}
+	return nil
 }
 
 func envOrDefault(key, def string) string {

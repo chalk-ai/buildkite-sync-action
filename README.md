@@ -83,15 +83,34 @@ steps:
 
 **API-only / managed pipeline (no automatic triggers):**
 ```yaml
-# .buildkite/nightly.yml
+# .buildkite/adhoc.yml
 on: {}
+
+steps:
+  - label: ":wrench: Ad-hoc job"
+    command: ./scripts/adhoc.sh
+```
+
+Using `on: {}` puts the pipeline under sync action management (creates/updates it) but configures no GitHub triggers — the pipeline will only run when triggered manually or via the Buildkite API.
+
+**Scheduled builds:**
+```yaml
+# .buildkite/nightly.yml
+on:
+  schedule:
+    - label: "Nightly"
+      cron: "0 2 * * *"
+      branch: main             # default: pipeline's default branch
+      message: "Nightly run"  # optional build message
+      env:                     # optional environment variables
+        NIGHTLY: "true"
 
 steps:
   - label: ":night_with_stars: Nightly job"
     command: ./scripts/nightly.sh
 ```
 
-Using `on: {}` puts the pipeline under sync action management (creates/updates it) but configures no GitHub triggers — the pipeline will only run when triggered manually or via the Buildkite API.
+Schedules can be combined with other triggers. The `label` field is required and acts as the stable identity for idempotent syncs — renaming a label deletes the old schedule and creates a new one. Schedules not present in the YAML are deleted from Buildkite on the next sync.
 
 Files without an `on:` block are skipped entirely and not managed by the action.
 
@@ -104,6 +123,12 @@ Files without an `on:` block are skipped entirely and not managed by the action.
 | `tag` | `branch_filter` | Glob pattern for tag name (e.g. `v*`) — sets `branch_configuration` on the pipeline |
 | `tag` | `conditional_filter` | Buildkite condition expression (e.g. `build.tag =~ /^v\d+\.\d+/`) |
 | `push` | `branches` | List of branches that trigger builds |
+| `schedule` | `label` | Required. Stable identifier used for idempotent sync |
+| `schedule` | `cron` | Required. Cron expression (e.g. `"0 2 * * *"`) |
+| `schedule` | `branch` | Branch to build (default: pipeline's default branch) |
+| `schedule` | `message` | Build message (optional) |
+| `schedule` | `env` | Environment variables as key/value pairs (optional) |
+| `schedule` | `enabled` | Whether the schedule is active (default: `true`) |
 
 ### Build behavior
 
