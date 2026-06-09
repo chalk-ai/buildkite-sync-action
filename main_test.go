@@ -61,6 +61,54 @@ func TestBootstrapConfigGroupDefaultsConcurrency(t *testing.T) {
 	}
 }
 
+func TestScheduleKeyAbsent(t *testing.T) {
+	t.Parallel()
+	var pf PipelineFile
+	if err := yaml.Unmarshal([]byte("on: {}\n"), &pf); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if pf.On.Schedule != nil {
+		t.Errorf("Schedule = non-nil, want nil when key is absent")
+	}
+}
+
+func TestScheduleKeyPresentButEmpty(t *testing.T) {
+	t.Parallel()
+	var pf PipelineFile
+	if err := yaml.Unmarshal([]byte("on:\n  schedule: []\n"), &pf); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if pf.On.Schedule == nil {
+		t.Fatal("Schedule is nil, want non-nil when key is present")
+	}
+	if len(*pf.On.Schedule) != 0 {
+		t.Errorf("len(Schedule) = %d, want 0", len(*pf.On.Schedule))
+	}
+}
+
+func TestNextLinkURL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		header string
+		want   string
+	}{
+		{
+			header: `<https://api.buildkite.com/v2/pipelines?page=2&per_page=100>; rel="next", <https://api.buildkite.com/v2/pipelines?page=5&per_page=100>; rel="last"`,
+			want:   "https://api.buildkite.com/v2/pipelines?page=2&per_page=100",
+		},
+		{
+			header: `<https://api.buildkite.com/v2/pipelines?page=5&per_page=100>; rel="last"`,
+			want:   "",
+		},
+		{header: "", want: ""},
+	}
+	for _, c := range cases {
+		if got := nextLinkURL(c.header); got != c.want {
+			t.Errorf("nextLinkURL(%q) = %q, want %q", c.header, got, c.want)
+		}
+	}
+}
+
 func TestToScheduleReqDefaults(t *testing.T) {
 	t.Parallel()
 	s := &ScheduleEntry{Label: "nightly", Cron: "0 2 * * *"}
@@ -123,10 +171,13 @@ on:
 	if pf.On == nil {
 		t.Fatal("On is nil")
 	}
-	if len(pf.On.Schedule) != 1 {
-		t.Fatalf("len(Schedule) = %d, want 1", len(pf.On.Schedule))
+	if pf.On.Schedule == nil {
+		t.Fatal("Schedule is nil, want non-nil")
 	}
-	s := pf.On.Schedule[0]
+	if len(*pf.On.Schedule) != 1 {
+		t.Fatalf("len(Schedule) = %d, want 1", len(*pf.On.Schedule))
+	}
+	s := (*pf.On.Schedule)[0]
 	if s.Label != "Nightly build" {
 		t.Errorf("Label = %q, want %q", s.Label, "Nightly build")
 	}
@@ -163,14 +214,17 @@ on:
 	if pf.On.Push == nil {
 		t.Fatal("Push is nil")
 	}
-	if len(pf.On.Schedule) != 2 {
-		t.Fatalf("len(Schedule) = %d, want 2", len(pf.On.Schedule))
+	if pf.On.Schedule == nil {
+		t.Fatal("Schedule is nil, want non-nil")
 	}
-	if pf.On.Schedule[0].Label != "Nightly" {
-		t.Errorf("Schedule[0].Label = %q, want %q", pf.On.Schedule[0].Label, "Nightly")
+	if len(*pf.On.Schedule) != 2 {
+		t.Fatalf("len(Schedule) = %d, want 2", len(*pf.On.Schedule))
 	}
-	if pf.On.Schedule[1].Label != "Weekly" {
-		t.Errorf("Schedule[1].Label = %q, want %q", pf.On.Schedule[1].Label, "Weekly")
+	if (*pf.On.Schedule)[0].Label != "Nightly" {
+		t.Errorf("Schedule[0].Label = %q, want %q", (*pf.On.Schedule)[0].Label, "Nightly")
+	}
+	if (*pf.On.Schedule)[1].Label != "Weekly" {
+		t.Errorf("Schedule[1].Label = %q, want %q", (*pf.On.Schedule)[1].Label, "Weekly")
 	}
 }
 
@@ -186,7 +240,10 @@ on:
 	if err := yaml.Unmarshal([]byte(input), &pf); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	s := pf.On.Schedule[0]
+	if pf.On.Schedule == nil {
+		t.Fatal("Schedule is nil, want non-nil")
+	}
+	s := (*pf.On.Schedule)[0]
 	if s.Branch != "" {
 		t.Errorf("Branch = %q, want empty", s.Branch)
 	}

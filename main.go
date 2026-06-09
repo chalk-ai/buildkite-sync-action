@@ -49,10 +49,12 @@ type BuildsConfig struct {
 }
 
 type TriggerConfig struct {
-	Push     *PushTrigger
-	PR       *PRTrigger
-	Tag      *TagTrigger
-	Schedule []*ScheduleEntry
+	Push *PushTrigger
+	PR   *PRTrigger
+	Tag  *TagTrigger
+	// Schedule is nil when the schedule: key is absent (don't touch schedules),
+	// and non-nil (even if empty) when the key is present (sync authoritatively).
+	Schedule *[]*ScheduleEntry
 }
 
 type PushTrigger struct {
@@ -110,8 +112,10 @@ func (t *TriggerConfig) UnmarshalYAML(value *yaml.Node) error {
 				}
 			}
 		case "schedule":
+			entries := make([]*ScheduleEntry, 0)
+			t.Schedule = &entries
 			if val.Kind == yaml.SequenceNode {
-				if err := val.Decode(&t.Schedule); err != nil {
+				if err := val.Decode(t.Schedule); err != nil {
 					return err
 				}
 			}
@@ -263,21 +267,29 @@ func run(ctx context.Context, cfg Config) error {
 	log.Printf("Found %d pipeline file(s) in %s", len(pipelines), cfg.PipelinesDir)
 	log.Printf("Target: %s/%s (org: %s, prefix: %q)", cfg.GitHubOwner, cfg.GitHubRepo, cfg.BuildkiteOrg, cfg.PipelinePrefix)
 
+	// Fetch all existing pipelines in one paginated call rather than one GET per pipeline.
+	var existing map[string]BuildkitePipelineResp
+	if !cfg.DryRun {
+		existing, err = listAllBuildkitePipelines(ctx, cfg)
+		if err != nil {
+			return fmt.Errorf("listing existing pipelines: %w", err)
+		}
+		log.Printf("Found %d existing pipeline(s) in Buildkite", len(existing))
+	}
+
 	var (
 		wg   sync.WaitGroup
 		mu   sync.Mutex
 		errs []error
 	)
 	for _, entry := range pipelines {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := syncPipeline(ctx, cfg, entry); err != nil {
+		wg.Go(func() {
+			if err := syncPipeline(ctx, cfg, entry, existing); err != nil {
 				mu.Lock()
 				errs = append(errs, err)
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -288,7 +300,7 @@ func run(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-func syncPipeline(ctx context.Context, cfg Config, entry pipelineEntry) error {
+func syncPipeline(ctx context.Context, cfg Config, entry pipelineEntry, existing map[string]BuildkitePipelineResp) error {
 	pf := entry.File
 	filename := entry.Filename
 	name := strings.TrimSuffix(strings.TrimSuffix(filename, ".yaml"), ".yml")
@@ -314,14 +326,18 @@ func syncPipeline(ctx context.Context, cfg Config, entry pipelineEntry) error {
 	pipelineCfg := buildPipelineConfig(pf)
 	branchConfig := buildBranchConfiguration(pf.On)
 
+	schedCount := 0
+	if pf.On.Schedule != nil {
+		schedCount = len(*pf.On.Schedule)
+	}
 	if pf.On.Push == nil && pf.On.PR == nil && pf.On.Tag == nil {
-		if len(pf.On.Schedule) > 0 {
-			logger.Printf("no GitHub triggers — schedule only (%d)", len(pf.On.Schedule))
+		if schedCount > 0 {
+			logger.Printf("no GitHub triggers — schedule only (%d)", schedCount)
 		} else {
 			logger.Printf("no GitHub triggers — pipeline will only be triggered via API")
 		}
 	} else {
-		logger.Printf("push=%v pr=%v tag=%v schedules=%d", pf.On.Push != nil, pf.On.PR != nil, pf.On.Tag != nil, len(pf.On.Schedule))
+		logger.Printf("push=%v pr=%v tag=%v schedules=%d", pf.On.Push != nil, pf.On.PR != nil, pf.On.Tag != nil, schedCount)
 	}
 
 	if cfg.DryRun {
@@ -336,34 +352,38 @@ func syncPipeline(ctx context.Context, cfg Config, entry pipelineEntry) error {
 			pipelineCfg.skipQueuedBuilds, pipelineCfg.skipQueuedBuildsFilter,
 			pipelineCfg.cancelRunningBuilds, pipelineCfg.cancelRunningBuildsFilter)
 		logger.Printf("[dry-run] bootstrap configuration:\n%s", bootstrap)
-		for _, s := range pf.On.Schedule {
-			req := toScheduleReq(s, cfg.DefaultBranch)
-			logger.Printf("[dry-run] schedule %q: %s on %s (enabled=%v)", req.Label, req.Cronline, req.Branch, req.Enabled)
+		if pf.On.Schedule != nil {
+			for _, s := range *pf.On.Schedule {
+				req := toScheduleReq(s, cfg.DefaultBranch)
+				logger.Printf("[dry-run] schedule %q: %s on %s (enabled=%v)", req.Label, req.Cronline, req.Branch, req.Enabled)
+			}
 		}
 		return nil
 	}
 
-	_, err := getBuildkitePipeline(ctx, cfg, slug)
-	var pipeline BuildkitePipelineResp
-	if err == nil {
+	var (
+		pipeline BuildkitePipelineResp
+		err      error
+	)
+	if _, found := existing[slug]; found {
 		logger.Printf("updating existing pipeline")
 		pipeline, err = updateBuildkitePipeline(ctx, cfg, slug, description, bootstrap, branchConfig, pipelineCfg)
 		if err != nil {
 			return fmt.Errorf("updating pipeline %s: %w", filename, err)
 		}
-	} else if errors.Is(err, errNotFound) {
+	} else {
 		logger.Printf("creating new pipeline %q", pipelineName)
 		pipeline, err = createBuildkitePipeline(ctx, cfg, pipelineName, description, bootstrap, branchConfig, pipelineCfg)
 		if err != nil {
 			return fmt.Errorf("creating pipeline %s: %w", filename, err)
 		}
-	} else {
-		return fmt.Errorf("looking up pipeline %s: %w", slug, err)
 	}
 	logger.Printf("URL: %s", pipeline.WebURL)
 
-	if err := syncSchedules(ctx, cfg, logger, pipeline.Slug, pf.On.Schedule, cfg.DefaultBranch); err != nil {
-		return fmt.Errorf("syncing schedules for %s: %w", filename, err)
+	if pf.On.Schedule != nil {
+		if err := syncSchedules(ctx, cfg, logger, pipeline.Slug, *pf.On.Schedule, cfg.DefaultBranch); err != nil {
+			return fmt.Errorf("syncing schedules for %s: %w", filename, err)
+		}
 	}
 
 	if pf.On.Push != nil || pf.On.PR != nil || pf.On.Tag != nil {
@@ -536,8 +556,8 @@ func triggerNames(on *TriggerConfig) string {
 	if on.Tag != nil {
 		names = append(names, "tag")
 	}
-	if len(on.Schedule) > 0 {
-		names = append(names, fmt.Sprintf("schedule(%d)", len(on.Schedule)))
+	if on.Schedule != nil && len(*on.Schedule) > 0 {
+		names = append(names, fmt.Sprintf("schedule(%d)", len(*on.Schedule)))
 	}
 	if len(names) == 0 {
 		return "api"
@@ -551,9 +571,6 @@ func toSlug(name string) string {
 	s = strings.ReplaceAll(s, " ", "-")
 	return s
 }
-
-// errNotFound is returned by getBuildkitePipeline when the pipeline does not exist.
-var errNotFound = errors.New("not found")
 
 // --- Buildkite API ---
 
@@ -655,52 +672,25 @@ func createBuildkiteWebhook(ctx context.Context, cfg Config, slug string) error 
 	return nil
 }
 
-func getBuildkitePipeline(ctx context.Context, cfg Config, slug string) (BuildkitePipelineResp, error) {
-	url := fmt.Sprintf("https://api.buildkite.com/v2/organizations/%s/pipelines/%s",
-		cfg.BuildkiteOrg, slug)
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return BuildkitePipelineResp{}, err
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode == 404 {
-		return BuildkitePipelineResp{}, errNotFound
-	}
-	if resp.StatusCode != 200 {
-		return BuildkitePipelineResp{}, fmt.Errorf("Buildkite get pipeline: %s: %s", resp.Status, body)
-	}
-
-	var pipeline BuildkitePipelineResp
-	if err := json.Unmarshal(body, &pipeline); err != nil {
-		return BuildkitePipelineResp{}, err
-	}
-	return pipeline, nil
-}
-
 // --- Buildkite Schedules API ---
 
 type BuildkiteScheduleReq struct {
-	Label   string            `json:"label"`
-	Cronline string           `json:"cronline"`
-	Branch  string            `json:"branch,omitempty"`
-	Message string            `json:"message,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
-	Enabled bool              `json:"enabled"`
+	Label    string            `json:"label"`
+	Cronline string            `json:"cronline"`
+	Branch   string            `json:"branch,omitempty"`
+	Message  string            `json:"message,omitempty"`
+	Env      map[string]string `json:"env,omitempty"`
+	Enabled  bool              `json:"enabled"`
 }
 
 type BuildkiteScheduleResp struct {
-	ID      string            `json:"id"`
-	Label   string            `json:"label"`
-	Cronline string           `json:"cronline"`
-	Branch  string            `json:"branch"`
-	Message string            `json:"message"`
-	Env     map[string]string `json:"env"`
-	Enabled bool              `json:"enabled"`
+	ID       string            `json:"id"`
+	Label    string            `json:"label"`
+	Cronline string            `json:"cronline"`
+	Branch   string            `json:"branch"`
+	Message  string            `json:"message"`
+	Env      map[string]string `json:"env"`
+	Enabled  bool              `json:"enabled"`
 }
 
 func toScheduleReq(s *ScheduleEntry, defaultBranch string) BuildkiteScheduleReq {
@@ -713,12 +703,12 @@ func toScheduleReq(s *ScheduleEntry, defaultBranch string) BuildkiteScheduleReq 
 		branch = defaultBranch
 	}
 	return BuildkiteScheduleReq{
-		Label:   s.Label,
+		Label:    s.Label,
 		Cronline: s.Cron,
-		Branch:  branch,
-		Message: s.Message,
-		Env:     s.Env,
-		Enabled: enabled,
+		Branch:   branch,
+		Message:  s.Message,
+		Env:      s.Env,
+		Enabled:  enabled,
 	}
 }
 
@@ -855,6 +845,51 @@ func deleteBuildkiteSchedule(ctx context.Context, cfg Config, slug, id string) e
 		return fmt.Errorf("Buildkite delete schedule: %s: %s", resp.Status, body)
 	}
 	return nil
+}
+
+func listAllBuildkitePipelines(ctx context.Context, cfg Config) (map[string]BuildkitePipelineResp, error) {
+	result := make(map[string]BuildkitePipelineResp)
+	url := fmt.Sprintf("https://api.buildkite.com/v2/organizations/%s/pipelines?per_page=100", cfg.BuildkiteOrg)
+	for url != "" {
+		req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+		req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			return nil, fmt.Errorf("Buildkite list pipelines: %s: %s", resp.Status, body)
+		}
+
+		var page []BuildkitePipelineResp
+		if err := json.Unmarshal(body, &page); err != nil {
+			return nil, err
+		}
+		for _, p := range page {
+			result[p.Slug] = p
+		}
+		url = nextLinkURL(resp.Header.Get("Link"))
+	}
+	return result, nil
+}
+
+// nextLinkURL parses a Link header and returns the URL for rel="next", or "" if absent.
+func nextLinkURL(link string) string {
+	for part := range strings.SplitSeq(link, ",") {
+		part = strings.TrimSpace(part)
+		if strings.Contains(part, `rel="next"`) {
+			if start := strings.Index(part, "<"); start >= 0 {
+				if end := strings.Index(part, ">"); end > start {
+					return part[start+1 : end]
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func envOrDefault(key, def string) string {
