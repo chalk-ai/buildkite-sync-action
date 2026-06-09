@@ -211,3 +211,13 @@ To preview what the action would do without making any API calls:
 BUILDKITE_API_TOKEN=<token> \
   go run main.go -dry-run -repo chalk-ai/my-repo -cluster-id <id>
 ```
+
+## Development
+
+```shell
+make build       # build ./buildkite-sync-action
+make pre-commit  # fmt, vet, fix, and test — run before committing
+make release     # force-move the v1 tag to HEAD and push
+```
+
+See `make help` for the full list with a local chalk-private dry-run example.
