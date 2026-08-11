@@ -12,6 +12,7 @@ help:  ## Show this help
 	@echo "    -repo chalk-ai/chalk-private \\"
 	@echo "    -cluster-id \$$BUILDKITE_CLUSTER_ID \\"
 	@echo "    -work-dir ../chalk-private \\"
+	@echo "    -upload-queue small-job-queue \\"
 	@echo "    -dry-run"
 
 build:  ## Build the binary (./buildkite-sync-action)
