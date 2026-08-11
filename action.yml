@@ -27,6 +27,14 @@ inputs:
     description: Print planned actions without making changes
     required: false
     default: 'false'
+  upload-queue:
+    description: >
+      Agent queue to pin the generated "Upload pipeline" bootstrap step to for every
+      synced pipeline. The step only checks out the repo and reads a YAML file, so
+      it needs no real compute — set this to your smallest agent queue. Leave empty
+      to keep the pipeline's default queue (no agents tag emitted).
+    required: false
+    default: ''
 
 # BUILDKITE_API_TOKEN is passed via env: in the calling workflow.
 
@@ -66,5 +74,8 @@ runs:
         fi
         if [[ "${{ inputs.dry-run }}" == "true" ]]; then
           ARGS+=(-dry-run)
+        fi
+        if [[ -n "${{ inputs.upload-queue }}" ]]; then
+          ARGS+=(-upload-queue "${{ inputs.upload-queue }}")
         fi
         "${{ github.action_path }}/sync-tool" "${ARGS[@]}"

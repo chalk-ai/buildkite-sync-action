@@ -189,6 +189,7 @@ type Config struct {
 	TeamUUID       string
 	PipelinesDir   string
 	PipelinePrefix string
+	UploadQueue    string
 	DryRun         bool
 }
 
@@ -208,6 +209,7 @@ func main() {
 	flag.StringVar(&cfg.ClusterID, "cluster-id", os.Getenv("BUILDKITE_CLUSTER_ID"), "Buildkite cluster ID")
 	flag.StringVar(&cfg.TeamUUID, "team-uuid", os.Getenv("BUILDKITE_TEAM_UUID"), "Buildkite team UUID to assign newly created pipelines to")
 	flag.StringVar(&cfg.PipelinePrefix, "prefix", "", "Prefix for pipeline names (e.g. 'chalk-router-')")
+	flag.StringVar(&cfg.UploadQueue, "upload-queue", os.Getenv("BUILDKITE_UPLOAD_QUEUE"), "Agent queue to pin the generated 'Upload pipeline' bootstrap step to (default queue if empty)")
 	flag.BoolVar(&cfg.DryRun, "dry-run", false, "Print what would be done without making changes")
 
 	var repo, workDir string
@@ -322,7 +324,7 @@ func syncPipeline(ctx context.Context, cfg Config, entry pipelineEntry, existing
 		uploadConcurrency = pf.Builds.Concurrency
 		uploadConcurrencyGroup = pf.Builds.ConcurrencyGroup
 	}
-	bootstrap := bootstrapConfig(cfg.PipelinesDir, filename, fileURL, uploadConcurrency, uploadConcurrencyGroup)
+	bootstrap := bootstrapConfig(cfg.PipelinesDir, filename, fileURL, uploadConcurrency, uploadConcurrencyGroup, cfg.UploadQueue)
 	pipelineCfg := buildPipelineConfig(pf)
 	branchConfig := buildBranchConfiguration(pf.On)
 
@@ -439,7 +441,12 @@ func discoverPipelines(dir string) ([]pipelineEntry, error) {
 // exist — this handles the case where a pipeline was created on another branch that
 // the current PR branch hasn't merged yet. On non-PR builds (e.g. main) a missing
 // file is still an error.
-func bootstrapConfig(dir, filename, fileURL string, concurrency int, concurrencyGroup string) string {
+//
+// The upload step itself only checks out the repo and reads a YAML file, so it needs
+// no meaningful compute. When uploadQueue is set, it's pinned to that (normally the
+// smallest) agent queue instead of floating onto whatever queue the pipeline's default
+// happens to be. Left empty, behavior is unchanged (no agents tag).
+func bootstrapConfig(dir, filename, fileURL string, concurrency int, concurrencyGroup string, uploadQueue string) string {
 	path := dir + "/" + filename
 	cmd := fmt.Sprintf(
 		`if [ -f %s ]; then buildkite-agent pipeline upload %s; elif [ "${BUILDKITE_PULL_REQUEST}" != "false" ]; then echo "Pipeline file %s not found on this PR branch, skipping."; else echo "Pipeline file %s not found!" && exit 1; fi`,
@@ -447,6 +454,9 @@ func bootstrapConfig(dir, filename, fileURL string, concurrency int, concurrency
 	)
 	var b strings.Builder
 	fmt.Fprintf(&b, "steps:\n  - label: \":pipeline: Upload pipeline — %s\"\n    command: %q\n", fileURL, cmd)
+	if uploadQueue != "" {
+		fmt.Fprintf(&b, "    agents:\n      queue: %q\n", uploadQueue)
+	}
 	// Gate the first job on the concurrency group so a newer build's upload stays
 	// queued (scheduled, not running) behind the active build. An un-gated upload
 	// starts immediately, flips the build to running, and defeats skip_intermediate.

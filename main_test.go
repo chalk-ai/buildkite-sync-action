@@ -24,7 +24,7 @@ func parseBootstrap(t *testing.T, cfg string) map[string]any {
 }
 
 func TestBootstrapConfigUngated(t *testing.T) {
-	cfg := bootstrapConfig(".buildkite", "metaplanner-matrix.yml", "https://example/blob", 0, "")
+	cfg := bootstrapConfig(".buildkite", "metaplanner-matrix.yml", "https://example/blob", 0, "", "")
 	step := parseBootstrap(t, cfg)
 
 	if _, ok := step["concurrency"]; ok {
@@ -33,13 +33,16 @@ func TestBootstrapConfigUngated(t *testing.T) {
 	if _, ok := step["concurrency_group"]; ok {
 		t.Errorf("expected no concurrency_group when group is empty:\n%s", cfg)
 	}
+	if _, ok := step["agents"]; ok {
+		t.Errorf("expected no agents tag when uploadQueue is empty:\n%s", cfg)
+	}
 	if cmd, _ := step["command"].(string); !strings.Contains(cmd, "buildkite-agent pipeline upload .buildkite/metaplanner-matrix.yml") {
 		t.Errorf("upload command missing or wrong:\n%s", cfg)
 	}
 }
 
 func TestBootstrapConfigGated(t *testing.T) {
-	cfg := bootstrapConfig(".buildkite", "metaplanner-matrix.yml", "https://example/blob", 1, "metaplanner-matrix/chalk-q-staging")
+	cfg := bootstrapConfig(".buildkite", "metaplanner-matrix.yml", "https://example/blob", 1, "metaplanner-matrix/chalk-q-staging", "")
 	step := parseBootstrap(t, cfg)
 
 	if got := step["concurrency"]; got != 1 {
@@ -53,11 +56,26 @@ func TestBootstrapConfigGated(t *testing.T) {
 // TestBootstrapConfigGroupDefaultsConcurrency verifies a group with an unset or
 // non-positive concurrency defaults to 1 rather than emitting an invalid 0.
 func TestBootstrapConfigGroupDefaultsConcurrency(t *testing.T) {
-	cfg := bootstrapConfig(".buildkite", "p.yml", "https://example/blob", 0, "grp")
+	cfg := bootstrapConfig(".buildkite", "p.yml", "https://example/blob", 0, "grp", "")
 	step := parseBootstrap(t, cfg)
 
 	if got := step["concurrency"]; got != 1 {
 		t.Errorf("concurrency = %v, want default 1:\n%s", got, cfg)
+	}
+}
+
+// TestBootstrapConfigUploadQueue verifies the upload step is pinned to the given
+// agent queue when uploadQueue is set.
+func TestBootstrapConfigUploadQueue(t *testing.T) {
+	cfg := bootstrapConfig(".buildkite", "metaplanner-matrix.yml", "https://example/blob", 0, "", "small-job-queue")
+	step := parseBootstrap(t, cfg)
+
+	agents, ok := step["agents"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected agents tag to be set:\n%s", cfg)
+	}
+	if got := agents["queue"]; got != "small-job-queue" {
+		t.Errorf("agents.queue = %v, want small-job-queue:\n%s", got, cfg)
 	}
 }
 
