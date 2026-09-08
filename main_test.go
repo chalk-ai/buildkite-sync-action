@@ -1,11 +1,125 @@
 package main
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+func TestDoBuildkiteRequestRetriesConflictAndRateLimit(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		headers     map[string]string
+		wantDelay   time.Duration
+		requestBody string
+	}{
+		{
+			name:        "conflict",
+			status:      http.StatusConflict,
+			wantDelay:   time.Second,
+			requestBody: "conflict-body",
+		},
+		{
+			name:        "rate limit",
+			status:      http.StatusTooManyRequests,
+			headers:     map[string]string{"RateLimit-Reset": "7", "RateLimit-User-Reset": "3"},
+			wantDelay:   7 * time.Second,
+			requestBody: "rate-limit-body",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var attempts int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts++
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatalf("read request body: %v", err)
+				}
+				if got := string(body); got != tt.requestBody {
+					t.Errorf("request body = %q, want %q", got, tt.requestBody)
+				}
+				if attempts == 1 {
+					for key, value := range tt.headers {
+						w.Header().Set(key, value)
+					}
+					w.WriteHeader(tt.status)
+					_, _ = w.Write([]byte(`{"reset": 2}`))
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("ok"))
+			}))
+			defer server.Close()
+
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodPatch, server.URL+"/pipelines/example", strings.NewReader(tt.requestBody))
+			if err != nil {
+				t.Fatalf("create request: %v", err)
+			}
+			var waits []time.Duration
+			body, _, err := doBuildkiteRequestWithRetry(
+				context.Background(),
+				server.Client(),
+				func(_ context.Context, delay time.Duration) error {
+					waits = append(waits, delay)
+					return nil
+				},
+				"test request",
+				req,
+				http.StatusOK,
+			)
+			if err != nil {
+				t.Fatalf("request failed unexpected error: %v", err)
+			}
+			if got := string(body); got != "ok" {
+				t.Errorf("response body = %q, want ok", got)
+			}
+			if attempts != 2 {
+				t.Errorf("attempts = %d, want 2", attempts)
+			}
+			if len(waits) != 1 || waits[0] != tt.wantDelay {
+				t.Errorf("waits = %v, want [%s]", waits, tt.wantDelay)
+			}
+		})
+	}
+}
+
+func TestDoBuildkiteRequestErrorIncludesRequestDetails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("invalid request"))
+	}))
+	defer server.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL+"/pipelines/example", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	_, _, err = doBuildkiteRequestWithRetry(
+		context.Background(),
+		server.Client(),
+		func(context.Context, time.Duration) error { return nil },
+		"test request",
+		req,
+		http.StatusOK,
+	)
+	if err == nil {
+		t.Fatal("request succeeded, want error")
+	}
+	for _, want := range []string{"test request", http.MethodGet, server.URL + "/pipelines/example", "400 Bad Request", "invalid request"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+}
 
 // parseBootstrap asserts the bootstrap config is valid YAML with a single step
 // and returns that step as a map.

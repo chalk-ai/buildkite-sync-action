@@ -12,8 +12,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -584,6 +586,101 @@ func toSlug(name string) string {
 
 // --- Buildkite API ---
 
+const buildkiteRequestMaxAttempts = 3
+
+type retryWaitFunc func(context.Context, time.Duration) error
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func buildkiteRetryDelay(resp *http.Response, body []byte, attempt int) (time.Duration, bool) {
+	switch resp.StatusCode {
+	case http.StatusConflict:
+		return time.Duration(attempt) * time.Second, true
+	case http.StatusTooManyRequests:
+		var resetSeconds int
+		for _, header := range []string{"Retry-After", "RateLimit-Reset", "RateLimit-User-Reset"} {
+			if value, err := strconv.Atoi(resp.Header.Get(header)); err == nil && value > resetSeconds {
+				resetSeconds = value
+			}
+		}
+		if resetSeconds == 0 {
+			var rateLimit struct {
+				Reset int `json:"reset"`
+			}
+			if json.Unmarshal(body, &rateLimit) == nil {
+				resetSeconds = rateLimit.Reset
+			}
+		}
+		if resetSeconds < 1 {
+			resetSeconds = 1
+		}
+		return time.Duration(resetSeconds) * time.Second, true
+	default:
+		return 0, false
+	}
+}
+
+func doBuildkiteRequest(ctx context.Context, operation string, req *http.Request, expectedStatuses ...int) ([]byte, http.Header, error) {
+	return doBuildkiteRequestWithRetry(ctx, http.DefaultClient, waitForRetry, operation, req, expectedStatuses...)
+}
+
+func doBuildkiteRequestWithRetry(
+	ctx context.Context,
+	client *http.Client,
+	wait retryWaitFunc,
+	operation string,
+	req *http.Request,
+	expectedStatuses ...int,
+) ([]byte, http.Header, error) {
+	for attempt := 1; attempt <= buildkiteRequestMaxAttempts; attempt++ {
+		if attempt > 1 && req.GetBody != nil {
+			body, err := req.GetBody()
+			if err != nil {
+				return nil, nil, fmt.Errorf("%s: resetting request body: %w", operation, err)
+			}
+			req.Body = body
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%s: %s %s: %w", operation, req.Method, req.URL.Redacted(), err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, nil, fmt.Errorf("%s: reading %s %s response: %w", operation, req.Method, req.URL.Redacted(), readErr)
+		}
+
+		for _, expected := range expectedStatuses {
+			if resp.StatusCode == expected {
+				return body, resp.Header, nil
+			}
+		}
+
+		if delay, retry := buildkiteRetryDelay(resp, body, attempt); retry && attempt < buildkiteRequestMaxAttempts {
+			log.Printf("%s: %s %s returned %s; retrying in %s (attempt %d/%d)",
+				operation, req.Method, req.URL.Redacted(), resp.Status, delay, attempt+1, buildkiteRequestMaxAttempts)
+			if err := wait(ctx, delay); err != nil {
+				return nil, nil, fmt.Errorf("%s: waiting to retry %s %s: %w", operation, req.Method, req.URL.Redacted(), err)
+			}
+			continue
+		}
+
+		return nil, nil, fmt.Errorf("%s: %s %s: %s: %s", operation, req.Method, req.URL.Redacted(), resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	return nil, nil, fmt.Errorf("%s: %s %s: retry limit exhausted", operation, req.Method, req.URL.Redacted())
+}
+
 func createBuildkitePipeline(ctx context.Context, cfg Config, name, description, configuration, branchConfiguration string, pc pipelineConfig) (BuildkitePipelineResp, error) {
 	payload := BuildkiteCreatePipelineReq{
 		Name:                            name,
@@ -609,15 +706,9 @@ func createBuildkitePipeline(ctx context.Context, cfg Config, name, description,
 	req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	respBody, _, err := doBuildkiteRequest(ctx, "Buildkite create pipeline", req, http.StatusCreated)
 	if err != nil {
 		return BuildkitePipelineResp{}, err
-	}
-	respBody, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode != 201 {
-		return BuildkitePipelineResp{}, fmt.Errorf("Buildkite create pipeline: %s: %s", resp.Status, respBody)
 	}
 
 	var pipeline BuildkitePipelineResp
@@ -645,15 +736,9 @@ func updateBuildkitePipeline(ctx context.Context, cfg Config, slug, description,
 	req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	respBody, _, err := doBuildkiteRequest(ctx, "Buildkite update pipeline", req, http.StatusOK)
 	if err != nil {
 		return BuildkitePipelineResp{}, err
-	}
-	respBody, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return BuildkitePipelineResp{}, fmt.Errorf("Buildkite update pipeline: %s: %s", resp.Status, respBody)
 	}
 
 	var pipeline BuildkitePipelineResp
@@ -669,17 +754,8 @@ func createBuildkiteWebhook(ctx context.Context, cfg Config, slug string) error 
 	req, _ := http.NewRequestWithContext(ctx, "POST", url, nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	respBody, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode != 201 && resp.StatusCode != 200 {
-		return fmt.Errorf("Buildkite create webhook: %s: %s", resp.Status, respBody)
-	}
-	return nil
+	_, _, err := doBuildkiteRequest(ctx, "Buildkite create webhook", req, http.StatusCreated, http.StatusOK)
+	return err
 }
 
 // --- Buildkite Schedules API ---
@@ -768,15 +844,9 @@ func listBuildkiteSchedules(ctx context.Context, cfg Config, slug string) ([]Bui
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
 
-	resp, err := http.DefaultClient.Do(req)
+	body, _, err := doBuildkiteRequest(ctx, "Buildkite list schedules", req, http.StatusOK)
 	if err != nil {
 		return nil, err
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("Buildkite list schedules: %s: %s", resp.Status, body)
 	}
 
 	var schedules []BuildkiteScheduleResp
@@ -794,15 +864,9 @@ func createBuildkiteSchedule(ctx context.Context, cfg Config, slug string, s Bui
 	req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	respBody, _, err := doBuildkiteRequest(ctx, "Buildkite create schedule", req, http.StatusCreated)
 	if err != nil {
 		return BuildkiteScheduleResp{}, err
-	}
-	respBody, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode != 201 {
-		return BuildkiteScheduleResp{}, fmt.Errorf("Buildkite create schedule: %s: %s", resp.Status, respBody)
 	}
 
 	var schedule BuildkiteScheduleResp
@@ -820,15 +884,9 @@ func updateBuildkiteSchedule(ctx context.Context, cfg Config, slug, id string, s
 	req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	respBody, _, err := doBuildkiteRequest(ctx, "Buildkite update schedule", req, http.StatusOK)
 	if err != nil {
 		return BuildkiteScheduleResp{}, err
-	}
-	respBody, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return BuildkiteScheduleResp{}, fmt.Errorf("Buildkite update schedule: %s: %s", resp.Status, respBody)
 	}
 
 	var schedule BuildkiteScheduleResp
@@ -844,17 +902,8 @@ func deleteBuildkiteSchedule(ctx context.Context, cfg Config, slug, id string) e
 	req, _ := http.NewRequestWithContext(ctx, "DELETE", url, nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode != 204 {
-		return fmt.Errorf("Buildkite delete schedule: %s: %s", resp.Status, body)
-	}
-	return nil
+	_, _, err := doBuildkiteRequest(ctx, "Buildkite delete schedule", req, http.StatusNoContent)
+	return err
 }
 
 func listAllBuildkitePipelines(ctx context.Context, cfg Config) (map[string]BuildkitePipelineResp, error) {
@@ -864,15 +913,9 @@ func listAllBuildkitePipelines(ctx context.Context, cfg Config) (map[string]Buil
 		req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 		req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
 
-		resp, err := http.DefaultClient.Do(req)
+		body, headers, err := doBuildkiteRequest(ctx, "Buildkite list pipelines", req, http.StatusOK)
 		if err != nil {
 			return nil, err
-		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			return nil, fmt.Errorf("Buildkite list pipelines: %s: %s", resp.Status, body)
 		}
 
 		var page []BuildkitePipelineResp
@@ -882,7 +925,7 @@ func listAllBuildkitePipelines(ctx context.Context, cfg Config) (map[string]Buil
 		for _, p := range page {
 			result[p.Slug] = p
 		}
-		url = nextLinkURL(resp.Header.Get("Link"))
+		url = nextLinkURL(headers.Get("Link"))
 	}
 	return result, nil
 }
