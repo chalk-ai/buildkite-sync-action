@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -118,6 +119,128 @@ func TestDoBuildkiteRequestErrorIncludesRequestDetails(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not contain %q", err, want)
 		}
+	}
+}
+
+func TestBuildkitePipelinesListURLFiltersByPrefix(t *testing.T) {
+	cfg := Config{
+		BuildkiteOrg:   "chalk",
+		PipelinePrefix: "chalk-private-",
+	}
+	got, err := url.Parse(buildkitePipelinesListURL(cfg))
+	if err != nil {
+		t.Fatalf("parse URL: %v", err)
+	}
+	if got.Path != "/v2/organizations/chalk/pipelines" {
+		t.Errorf("path = %q, want pipeline list path", got.Path)
+	}
+	if value := got.Query().Get("per_page"); value != "100" {
+		t.Errorf("per_page = %q, want 100", value)
+	}
+	if value := got.Query().Get("name"); value != cfg.PipelinePrefix {
+		t.Errorf("name = %q, want %q", value, cfg.PipelinePrefix)
+	}
+}
+
+func TestPipelineMatches(t *testing.T) {
+	desired := pipelineConfig{
+		providerSettings: &BuildkiteProviderSettings{
+			TriggerMode:                    "code",
+			BuildPullRequests:              true,
+			PublishCommitStatus:            true,
+			PullRequestBranchFilterEnabled: true,
+			PullRequestBranchFilterConfig:  "dev",
+		},
+		skipQueuedBuilds:          true,
+		skipQueuedBuildsFilter:    "!dev",
+		cancelRunningBuilds:       true,
+		cancelRunningBuildsFilter: "!dev",
+	}
+	existing := BuildkitePipelineResp{
+		Description:                     "description",
+		Configuration:                   "steps: []\n",
+		BranchConfiguration:             "dev",
+		SkipQueuedBranchBuilds:          true,
+		SkipQueuedBranchBuildsFilter:    "!dev",
+		CancelRunningBranchBuilds:       true,
+		CancelRunningBranchBuildsFilter: "!dev",
+	}
+	existing.Provider.Settings = *desired.providerSettings
+
+	if !pipelineMatches(existing, "description", "steps: []\n", "dev", desired) {
+		t.Fatal("matching pipeline reported a difference")
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*BuildkitePipelineResp)
+	}{
+		{name: "description", mutate: func(p *BuildkitePipelineResp) { p.Description = "different" }},
+		{name: "configuration", mutate: func(p *BuildkitePipelineResp) { p.Configuration = "steps: [different]\n" }},
+		{name: "branch configuration", mutate: func(p *BuildkitePipelineResp) { p.BranchConfiguration = "main" }},
+		{name: "skip queued builds", mutate: func(p *BuildkitePipelineResp) { p.SkipQueuedBranchBuilds = false }},
+		{name: "skip filter", mutate: func(p *BuildkitePipelineResp) { p.SkipQueuedBranchBuildsFilter = "main" }},
+		{name: "cancel running builds", mutate: func(p *BuildkitePipelineResp) { p.CancelRunningBranchBuilds = false }},
+		{name: "cancel filter", mutate: func(p *BuildkitePipelineResp) { p.CancelRunningBranchBuildsFilter = "main" }},
+		{name: "provider settings", mutate: func(p *BuildkitePipelineResp) { p.Provider.Settings.BuildPullRequests = false }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			changed := existing
+			tt.mutate(&changed)
+			if pipelineMatches(changed, "description", "steps: []\n", "dev", desired) {
+				t.Fatal("changed pipeline reported as matching")
+			}
+		})
+	}
+}
+
+func TestScheduleMatches(t *testing.T) {
+	existing := BuildkiteScheduleResp{
+		Label:    "nightly",
+		Cronline: "0 2 * * *",
+		Branch:   "dev",
+		Message:  "Nightly",
+		Env:      map[string]string{"ENV": "test"},
+		Enabled:  true,
+	}
+	desired := BuildkiteScheduleReq{
+		Label:    existing.Label,
+		Cronline: existing.Cronline,
+		Branch:   existing.Branch,
+		Message:  existing.Message,
+		Env:      map[string]string{"ENV": "test"},
+		Enabled:  existing.Enabled,
+	}
+	if !scheduleMatches(existing, desired) {
+		t.Fatal("matching schedule reported a difference")
+	}
+
+	desired.Env["ENV"] = "production"
+	if scheduleMatches(existing, desired) {
+		t.Fatal("changed schedule reported as matching")
+	}
+	if !scheduleMatches(BuildkiteScheduleResp{}, BuildkiteScheduleReq{}) {
+		t.Fatal("nil and empty schedule fields should match")
+	}
+}
+
+func TestShouldCreateBuildkiteWebhook(t *testing.T) {
+	triggered := &TriggerConfig{Push: &PushTrigger{}}
+	if !shouldCreateBuildkiteWebhook(triggered, BuildkitePipelineResp{}) {
+		t.Fatal("missing webhook for a triggered pipeline should be created")
+	}
+
+	existing := BuildkitePipelineResp{}
+	existing.Provider.WebhookURL = "https://webhook.buildkite.com/deliver/example"
+	if shouldCreateBuildkiteWebhook(triggered, existing) {
+		t.Fatal("existing webhook should not be created again")
+	}
+	if shouldCreateBuildkiteWebhook(&TriggerConfig{}, BuildkitePipelineResp{}) {
+		t.Fatal("pipeline without GitHub triggers should not get a webhook")
+	}
+	if shouldCreateBuildkiteWebhook(nil, BuildkitePipelineResp{}) {
+		t.Fatal("nil trigger configuration should not get a webhook")
 	}
 }
 

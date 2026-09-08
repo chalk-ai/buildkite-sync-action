@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -170,13 +171,21 @@ type BuildkiteUpdatePipelineReq struct {
 }
 
 type BuildkitePipelineResp struct {
-	ID       string `json:"id"`
-	Slug     string `json:"slug"`
-	Name     string `json:"name"`
-	WebURL   string `json:"web_url"`
-	Provider struct {
-		ID         string `json:"id"`
-		WebhookURL string `json:"webhook_url"`
+	ID                              string `json:"id"`
+	Slug                            string `json:"slug"`
+	Name                            string `json:"name"`
+	WebURL                          string `json:"web_url"`
+	Description                     string `json:"description"`
+	Configuration                   string `json:"configuration"`
+	BranchConfiguration             string `json:"branch_configuration"`
+	SkipQueuedBranchBuilds          bool   `json:"skip_queued_branch_builds"`
+	SkipQueuedBranchBuildsFilter    string `json:"skip_queued_branch_builds_filter"`
+	CancelRunningBranchBuilds       bool   `json:"cancel_running_branch_builds"`
+	CancelRunningBranchBuildsFilter string `json:"cancel_running_branch_builds_filter"`
+	Provider                        struct {
+		ID         string                    `json:"id"`
+		WebhookURL string                    `json:"webhook_url"`
+		Settings   BuildkiteProviderSettings `json:"settings"`
 	} `json:"provider"`
 }
 
@@ -369,11 +378,16 @@ func syncPipeline(ctx context.Context, cfg Config, entry pipelineEntry, existing
 		pipeline BuildkitePipelineResp
 		err      error
 	)
-	if _, found := existing[slug]; found {
-		logger.Printf("updating existing pipeline")
-		pipeline, err = updateBuildkitePipeline(ctx, cfg, slug, description, bootstrap, branchConfig, pipelineCfg)
-		if err != nil {
-			return fmt.Errorf("updating pipeline %s: %w", filename, err)
+	if current, found := existing[slug]; found {
+		if pipelineMatches(current, description, bootstrap, branchConfig, pipelineCfg) {
+			logger.Printf("pipeline configuration unchanged")
+			pipeline = current
+		} else {
+			logger.Printf("updating existing pipeline")
+			pipeline, err = updateBuildkitePipeline(ctx, cfg, slug, description, bootstrap, branchConfig, pipelineCfg)
+			if err != nil {
+				return fmt.Errorf("updating pipeline %s: %w", filename, err)
+			}
 		}
 	} else {
 		logger.Printf("creating new pipeline %q", pipelineName)
@@ -390,17 +404,27 @@ func syncPipeline(ctx context.Context, cfg Config, entry pipelineEntry, existing
 		}
 	}
 
-	if pf.On.Push != nil || pf.On.PR != nil || pf.On.Tag != nil {
+	if shouldCreateBuildkiteWebhook(pf.On, pipeline) {
 		logger.Printf("registering GitHub webhook...")
 		if err = createBuildkiteWebhook(ctx, cfg, pipeline.Slug); err != nil {
 			logger.Printf("warning: could not register webhook: %v (may already be registered)", err)
 		} else {
 			logger.Printf("webhook registered")
 		}
-	} else {
+	} else if !hasGitHubTriggers(pf.On) {
 		logger.Printf("skipping webhook registration (no GitHub triggers)")
+	} else {
+		logger.Printf("GitHub webhook already registered")
 	}
 	return nil
+}
+
+func hasGitHubTriggers(on *TriggerConfig) bool {
+	return on != nil && (on.Push != nil || on.PR != nil || on.Tag != nil)
+}
+
+func shouldCreateBuildkiteWebhook(on *TriggerConfig, pipeline BuildkitePipelineResp) bool {
+	return hasGitHubTriggers(on) && pipeline.Provider.WebhookURL == ""
 }
 
 // discoverPipelines finds all .yml/.yaml files in dir and parses their `on:` block.
@@ -542,6 +566,17 @@ func buildPipelineConfig(pf *PipelineFile) pipelineConfig {
 		pc.cancelRunningBuildsFilter = branchFilter
 	}
 	return pc
+}
+
+func pipelineMatches(existing BuildkitePipelineResp, description, configuration, branchConfiguration string, desired pipelineConfig) bool {
+	return existing.Description == description &&
+		existing.Configuration == configuration &&
+		existing.BranchConfiguration == branchConfiguration &&
+		existing.SkipQueuedBranchBuilds == desired.skipQueuedBuilds &&
+		existing.SkipQueuedBranchBuildsFilter == desired.skipQueuedBuildsFilter &&
+		existing.CancelRunningBranchBuilds == desired.cancelRunningBuilds &&
+		existing.CancelRunningBranchBuildsFilter == desired.cancelRunningBuildsFilter &&
+		existing.Provider.Settings == *desired.providerSettings
 }
 
 // buildBranchConfiguration returns the top-level branch_configuration glob for the pipeline.
@@ -814,6 +849,10 @@ func syncSchedules(ctx context.Context, cfg Config, logger *log.Logger, slug str
 		seen[s.Label] = true
 		req := toScheduleReq(s, defaultBranch)
 		if ex, ok := existingByLabel[s.Label]; ok {
+			if scheduleMatches(ex, req) {
+				logger.Printf("schedule %q unchanged", s.Label)
+				continue
+			}
 			logger.Printf("updating schedule %q", s.Label)
 			if _, err := updateBuildkiteSchedule(ctx, cfg, slug, ex.ID, req); err != nil {
 				return fmt.Errorf("updating schedule %q: %w", s.Label, err)
@@ -836,6 +875,23 @@ func syncSchedules(ctx context.Context, cfg Config, logger *log.Logger, slug str
 	}
 
 	return nil
+}
+
+func scheduleMatches(existing BuildkiteScheduleResp, desired BuildkiteScheduleReq) bool {
+	if existing.Label != desired.Label ||
+		existing.Cronline != desired.Cronline ||
+		existing.Branch != desired.Branch ||
+		existing.Message != desired.Message ||
+		existing.Enabled != desired.Enabled ||
+		len(existing.Env) != len(desired.Env) {
+		return false
+	}
+	for key, value := range existing.Env {
+		if desired.Env[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func listBuildkiteSchedules(ctx context.Context, cfg Config, slug string) ([]BuildkiteScheduleResp, error) {
@@ -908,9 +964,9 @@ func deleteBuildkiteSchedule(ctx context.Context, cfg Config, slug, id string) e
 
 func listAllBuildkitePipelines(ctx context.Context, cfg Config) (map[string]BuildkitePipelineResp, error) {
 	result := make(map[string]BuildkitePipelineResp)
-	url := fmt.Sprintf("https://api.buildkite.com/v2/organizations/%s/pipelines?per_page=100", cfg.BuildkiteOrg)
-	for url != "" {
-		req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	listURL := buildkitePipelinesListURL(cfg)
+	for listURL != "" {
+		req, _ := http.NewRequestWithContext(ctx, "GET", listURL, nil)
 		req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
 
 		body, headers, err := doBuildkiteRequest(ctx, "Buildkite list pipelines", req, http.StatusOK)
@@ -925,9 +981,17 @@ func listAllBuildkitePipelines(ctx context.Context, cfg Config) (map[string]Buil
 		for _, p := range page {
 			result[p.Slug] = p
 		}
-		url = nextLinkURL(headers.Get("Link"))
+		listURL = nextLinkURL(headers.Get("Link"))
 	}
 	return result, nil
+}
+
+func buildkitePipelinesListURL(cfg Config) string {
+	query := url.Values{
+		"name":     {cfg.PipelinePrefix},
+		"per_page": {"100"},
+	}
+	return fmt.Sprintf("https://api.buildkite.com/v2/organizations/%s/pipelines?%s", cfg.BuildkiteOrg, query.Encode())
 }
 
 // nextLinkURL parses a Link header and returns the URL for rel="next", or "" if absent.
