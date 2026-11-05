@@ -225,55 +225,78 @@ func TestScheduleMatches(t *testing.T) {
 	}
 }
 
-func TestShouldCreateBuildkiteWebhook(t *testing.T) {
+func TestHasGitHubTriggers(t *testing.T) {
 	triggered := &TriggerConfig{Push: &PushTrigger{}}
-	if !shouldCreateBuildkiteWebhook(triggered) {
+	if !hasGitHubTriggers(triggered) {
 		t.Fatal("triggered pipeline should ensure its webhook is registered")
 	}
-	if shouldCreateBuildkiteWebhook(&TriggerConfig{}) {
+	if hasGitHubTriggers(&TriggerConfig{}) {
 		t.Fatal("pipeline without GitHub triggers should not get a webhook")
 	}
-	if shouldCreateBuildkiteWebhook(nil) {
+	if hasGitHubTriggers(nil) {
 		t.Fatal("nil trigger configuration should not get a webhook")
 	}
 }
 
-func TestCreateBuildkiteWebhookAlreadyRegistered(t *testing.T) {
-	var attempts, waits int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempts++
-		if r.Method != http.MethodPost {
-			t.Errorf("method = %q, want POST", r.Method)
-		}
-		w.WriteHeader(http.StatusUnprocessableEntity)
-		_, _ = w.Write([]byte("webhook already exists"))
-	}))
-	defer server.Close()
-
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, server.URL+"/webhook", nil)
-	if err != nil {
-		t.Fatalf("create request: %v", err)
-	}
-	alreadyRegistered, err := createBuildkiteWebhookWithRetry(
-		context.Background(),
-		server.Client(),
-		func(context.Context, time.Duration) error {
-			waits++
-			return nil
+func TestCreateBuildkiteWebhookUnprocessableEntity(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		wantMessage string
+		wantErr     bool
+	}{
+		{
+			name:        "may already be registered",
+			body:        `{"message":"Webhooks could not be created for your repository."}`,
+			wantMessage: "Webhooks could not be created for your repository.",
 		},
-		req,
-	)
-	if err != nil {
-		t.Fatalf("create webhook returned unexpected error: %v", err)
+		{
+			name:    "auto-creating unsupported",
+			body:    `{"message":"Auto-creating webhooks is not supported for your repository."}`,
+			wantErr: true,
+		},
 	}
-	if !alreadyRegistered {
-		t.Fatal("create webhook did not report existing webhook")
-	}
-	if attempts != 1 {
-		t.Errorf("attempts = %d, want 1", attempts)
-	}
-	if waits != 0 {
-		t.Errorf("waits = %d, want 0", waits)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var attempts, waits int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts++
+				if r.Method != http.MethodPost {
+					t.Errorf("method = %q, want POST", r.Method)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, server.URL+"/webhook", nil)
+			if err != nil {
+				t.Fatalf("create request: %v", err)
+			}
+			message, err := createBuildkiteWebhookWithRetry(
+				context.Background(),
+				server.Client(),
+				func(context.Context, time.Duration) error {
+					waits++
+					return nil
+				},
+				req,
+			)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("create webhook error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if message != tt.wantMessage {
+				t.Errorf("message = %q, want %q", message, tt.wantMessage)
+			}
+			if attempts != 1 {
+				t.Errorf("attempts = %d, want 1", attempts)
+			}
+			if waits != 0 {
+				t.Errorf("waits = %d, want 0", waits)
+			}
+		})
 	}
 }
 
