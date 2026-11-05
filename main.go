@@ -405,11 +405,8 @@ func syncPipeline(ctx context.Context, cfg Config, entry pipelineEntry, existing
 
 	if hasGitHubTriggers(pf.On) {
 		logger.Printf("registering GitHub webhook...")
-		webhookMessage, webhookErr := createBuildkiteWebhook(ctx, cfg, pipeline.Slug)
-		if webhookErr != nil {
-			logger.Printf("warning: could not register webhook: %v", webhookErr)
-		} else if webhookMessage != "" {
-			logger.Printf("GitHub webhook not created: %s; likely already registered", webhookMessage)
+		if err := createBuildkiteWebhook(ctx, cfg, pipeline.Slug); err != nil {
+			logger.Printf("warning: could not register webhook: %v", err)
 		} else {
 			logger.Printf("webhook registered")
 		}
@@ -664,16 +661,6 @@ func doBuildkiteRequest(ctx context.Context, operation string, req *http.Request
 	return doBuildkiteRequestWithRetry(ctx, http.DefaultClient, waitForRetry, operation, req, expectedStatuses...)
 }
 
-type buildkiteResponseError struct {
-	statusCode      int
-	message         string
-	responseMessage string
-}
-
-func (e *buildkiteResponseError) Error() string {
-	return e.message
-}
-
 func doBuildkiteRequestWithRetry(
 	ctx context.Context,
 	client *http.Client,
@@ -716,15 +703,7 @@ func doBuildkiteRequestWithRetry(
 			continue
 		}
 
-		var errorResponse struct {
-			Message string `json:"message"`
-		}
-		_ = json.Unmarshal(body, &errorResponse)
-		return nil, nil, &buildkiteResponseError{
-			statusCode:      resp.StatusCode,
-			message:         fmt.Sprintf("%s: %s %s: %s: %s", operation, req.Method, req.URL.Redacted(), resp.Status, strings.TrimSpace(string(body))),
-			responseMessage: errorResponse.Message,
-		}
+		return nil, nil, fmt.Errorf("%s: %s %s: %s: %s", operation, req.Method, req.URL.Redacted(), resp.Status, strings.TrimSpace(string(body)))
 	}
 
 	return nil, nil, fmt.Errorf("%s: %s %s: retry limit exhausted", operation, req.Method, req.URL.Redacted())
@@ -797,24 +776,14 @@ func updateBuildkitePipeline(ctx context.Context, cfg Config, slug, description,
 	return pipeline, nil
 }
 
-func createBuildkiteWebhook(ctx context.Context, cfg Config, slug string) (string, error) {
+func createBuildkiteWebhook(ctx context.Context, cfg Config, slug string) error {
 	url := fmt.Sprintf("https://api.buildkite.com/v2/organizations/%s/pipelines/%s/webhook",
 		cfg.BuildkiteOrg, slug)
 	req, _ := http.NewRequestWithContext(ctx, "POST", url, nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
 
-	return createBuildkiteWebhookWithRetry(ctx, http.DefaultClient, waitForRetry, req)
-}
-
-func createBuildkiteWebhookWithRetry(ctx context.Context, client *http.Client, wait retryWaitFunc, req *http.Request) (string, error) {
-	_, _, err := doBuildkiteRequestWithRetry(ctx, client, wait, "Buildkite create webhook", req, http.StatusCreated, http.StatusOK)
-	var responseErr *buildkiteResponseError
-	if errors.As(err, &responseErr) &&
-		responseErr.statusCode == http.StatusUnprocessableEntity &&
-		responseErr.responseMessage == "Webhooks could not be created for your repository." {
-		return responseErr.responseMessage, nil
-	}
-	return "", err
+	_, _, err := doBuildkiteRequest(ctx, "Buildkite create webhook", req, http.StatusCreated, http.StatusOK)
+	return err
 }
 
 // --- Buildkite Schedules API ---
