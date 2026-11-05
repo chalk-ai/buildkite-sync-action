@@ -183,9 +183,8 @@ type BuildkitePipelineResp struct {
 	CancelRunningBranchBuilds       bool   `json:"cancel_running_branch_builds"`
 	CancelRunningBranchBuildsFilter string `json:"cancel_running_branch_builds_filter"`
 	Provider                        struct {
-		ID         string                    `json:"id"`
-		WebhookURL string                    `json:"webhook_url"`
-		Settings   BuildkiteProviderSettings `json:"settings"`
+		ID       string                    `json:"id"`
+		Settings BuildkiteProviderSettings `json:"settings"`
 	} `json:"provider"`
 }
 
@@ -404,27 +403,21 @@ func syncPipeline(ctx context.Context, cfg Config, entry pipelineEntry, existing
 		}
 	}
 
-	if shouldCreateBuildkiteWebhook(pf.On, pipeline) {
+	if hasGitHubTriggers(pf.On) {
 		logger.Printf("registering GitHub webhook...")
-		if err = createBuildkiteWebhook(ctx, cfg, pipeline.Slug); err != nil {
-			logger.Printf("warning: could not register webhook: %v (may already be registered)", err)
+		if err := createBuildkiteWebhook(ctx, cfg, pipeline.Slug); err != nil {
+			logger.Printf("warning: could not register webhook: %v", err)
 		} else {
 			logger.Printf("webhook registered")
 		}
-	} else if !hasGitHubTriggers(pf.On) {
-		logger.Printf("skipping webhook registration (no GitHub triggers)")
 	} else {
-		logger.Printf("GitHub webhook already registered")
+		logger.Printf("skipping webhook registration (no GitHub triggers)")
 	}
 	return nil
 }
 
 func hasGitHubTriggers(on *TriggerConfig) bool {
 	return on != nil && (on.Push != nil || on.PR != nil || on.Tag != nil)
-}
-
-func shouldCreateBuildkiteWebhook(on *TriggerConfig, pipeline BuildkitePipelineResp) bool {
-	return hasGitHubTriggers(on) && pipeline.Provider.WebhookURL == ""
 }
 
 // discoverPipelines finds all .yml/.yaml files in dir and parses their `on:` block.

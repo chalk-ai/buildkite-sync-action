@@ -225,21 +225,15 @@ func TestScheduleMatches(t *testing.T) {
 	}
 }
 
-func TestShouldCreateBuildkiteWebhook(t *testing.T) {
+func TestHasGitHubTriggers(t *testing.T) {
 	triggered := &TriggerConfig{Push: &PushTrigger{}}
-	if !shouldCreateBuildkiteWebhook(triggered, BuildkitePipelineResp{}) {
-		t.Fatal("missing webhook for a triggered pipeline should be created")
+	if !hasGitHubTriggers(triggered) {
+		t.Fatal("triggered pipeline should ensure its webhook is registered")
 	}
-
-	existing := BuildkitePipelineResp{}
-	existing.Provider.WebhookURL = "https://webhook.buildkite.com/deliver/example"
-	if shouldCreateBuildkiteWebhook(triggered, existing) {
-		t.Fatal("existing webhook should not be created again")
-	}
-	if shouldCreateBuildkiteWebhook(&TriggerConfig{}, BuildkitePipelineResp{}) {
+	if hasGitHubTriggers(&TriggerConfig{}) {
 		t.Fatal("pipeline without GitHub triggers should not get a webhook")
 	}
-	if shouldCreateBuildkiteWebhook(nil, BuildkitePipelineResp{}) {
+	if hasGitHubTriggers(nil) {
 		t.Fatal("nil trigger configuration should not get a webhook")
 	}
 }
