@@ -227,20 +227,53 @@ func TestScheduleMatches(t *testing.T) {
 
 func TestShouldCreateBuildkiteWebhook(t *testing.T) {
 	triggered := &TriggerConfig{Push: &PushTrigger{}}
-	if !shouldCreateBuildkiteWebhook(triggered, BuildkitePipelineResp{}) {
-		t.Fatal("missing webhook for a triggered pipeline should be created")
+	if !shouldCreateBuildkiteWebhook(triggered) {
+		t.Fatal("triggered pipeline should ensure its webhook is registered")
 	}
-
-	existing := BuildkitePipelineResp{}
-	existing.Provider.WebhookURL = "https://webhook.buildkite.com/deliver/example"
-	if shouldCreateBuildkiteWebhook(triggered, existing) {
-		t.Fatal("existing webhook should not be created again")
-	}
-	if shouldCreateBuildkiteWebhook(&TriggerConfig{}, BuildkitePipelineResp{}) {
+	if shouldCreateBuildkiteWebhook(&TriggerConfig{}) {
 		t.Fatal("pipeline without GitHub triggers should not get a webhook")
 	}
-	if shouldCreateBuildkiteWebhook(nil, BuildkitePipelineResp{}) {
+	if shouldCreateBuildkiteWebhook(nil) {
 		t.Fatal("nil trigger configuration should not get a webhook")
+	}
+}
+
+func TestCreateBuildkiteWebhookAlreadyRegistered(t *testing.T) {
+	var attempts, waits int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %q, want POST", r.Method)
+		}
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte("webhook already exists"))
+	}))
+	defer server.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, server.URL+"/webhook", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	alreadyRegistered, err := createBuildkiteWebhookWithRetry(
+		context.Background(),
+		server.Client(),
+		func(context.Context, time.Duration) error {
+			waits++
+			return nil
+		},
+		req,
+	)
+	if err != nil {
+		t.Fatalf("create webhook returned unexpected error: %v", err)
+	}
+	if !alreadyRegistered {
+		t.Fatal("create webhook did not report existing webhook")
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1", attempts)
+	}
+	if waits != 0 {
+		t.Errorf("waits = %d, want 0", waits)
 	}
 }
 

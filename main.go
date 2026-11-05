@@ -183,9 +183,8 @@ type BuildkitePipelineResp struct {
 	CancelRunningBranchBuilds       bool   `json:"cancel_running_branch_builds"`
 	CancelRunningBranchBuildsFilter string `json:"cancel_running_branch_builds_filter"`
 	Provider                        struct {
-		ID         string                    `json:"id"`
-		WebhookURL string                    `json:"webhook_url"`
-		Settings   BuildkiteProviderSettings `json:"settings"`
+		ID       string                    `json:"id"`
+		Settings BuildkiteProviderSettings `json:"settings"`
 	} `json:"provider"`
 }
 
@@ -404,17 +403,18 @@ func syncPipeline(ctx context.Context, cfg Config, entry pipelineEntry, existing
 		}
 	}
 
-	if shouldCreateBuildkiteWebhook(pf.On, pipeline) {
+	if shouldCreateBuildkiteWebhook(pf.On) {
 		logger.Printf("registering GitHub webhook...")
-		if err = createBuildkiteWebhook(ctx, cfg, pipeline.Slug); err != nil {
-			logger.Printf("warning: could not register webhook: %v (may already be registered)", err)
+		alreadyRegistered, webhookErr := createBuildkiteWebhook(ctx, cfg, pipeline.Slug)
+		if webhookErr != nil {
+			logger.Printf("warning: could not register webhook: %v (may already be registered)", webhookErr)
+		} else if alreadyRegistered {
+			logger.Printf("GitHub webhook already registered")
 		} else {
 			logger.Printf("webhook registered")
 		}
-	} else if !hasGitHubTriggers(pf.On) {
-		logger.Printf("skipping webhook registration (no GitHub triggers)")
 	} else {
-		logger.Printf("GitHub webhook already registered")
+		logger.Printf("skipping webhook registration (no GitHub triggers)")
 	}
 	return nil
 }
@@ -423,8 +423,8 @@ func hasGitHubTriggers(on *TriggerConfig) bool {
 	return on != nil && (on.Push != nil || on.PR != nil || on.Tag != nil)
 }
 
-func shouldCreateBuildkiteWebhook(on *TriggerConfig, pipeline BuildkitePipelineResp) bool {
-	return hasGitHubTriggers(on) && pipeline.Provider.WebhookURL == ""
+func shouldCreateBuildkiteWebhook(on *TriggerConfig) bool {
+	return hasGitHubTriggers(on)
 }
 
 // discoverPipelines finds all .yml/.yaml files in dir and parses their `on:` block.
@@ -668,6 +668,15 @@ func doBuildkiteRequest(ctx context.Context, operation string, req *http.Request
 	return doBuildkiteRequestWithRetry(ctx, http.DefaultClient, waitForRetry, operation, req, expectedStatuses...)
 }
 
+type buildkiteResponseError struct {
+	statusCode int
+	message    string
+}
+
+func (e *buildkiteResponseError) Error() string {
+	return e.message
+}
+
 func doBuildkiteRequestWithRetry(
 	ctx context.Context,
 	client *http.Client,
@@ -710,7 +719,10 @@ func doBuildkiteRequestWithRetry(
 			continue
 		}
 
-		return nil, nil, fmt.Errorf("%s: %s %s: %s: %s", operation, req.Method, req.URL.Redacted(), resp.Status, strings.TrimSpace(string(body)))
+		return nil, nil, &buildkiteResponseError{
+			statusCode: resp.StatusCode,
+			message:    fmt.Sprintf("%s: %s %s: %s: %s", operation, req.Method, req.URL.Redacted(), resp.Status, strings.TrimSpace(string(body))),
+		}
 	}
 
 	return nil, nil, fmt.Errorf("%s: %s %s: retry limit exhausted", operation, req.Method, req.URL.Redacted())
@@ -783,14 +795,22 @@ func updateBuildkitePipeline(ctx context.Context, cfg Config, slug, description,
 	return pipeline, nil
 }
 
-func createBuildkiteWebhook(ctx context.Context, cfg Config, slug string) error {
+func createBuildkiteWebhook(ctx context.Context, cfg Config, slug string) (bool, error) {
 	url := fmt.Sprintf("https://api.buildkite.com/v2/organizations/%s/pipelines/%s/webhook",
 		cfg.BuildkiteOrg, slug)
 	req, _ := http.NewRequestWithContext(ctx, "POST", url, nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.BuildkiteToken)
 
-	_, _, err := doBuildkiteRequest(ctx, "Buildkite create webhook", req, http.StatusCreated, http.StatusOK)
-	return err
+	return createBuildkiteWebhookWithRetry(ctx, http.DefaultClient, waitForRetry, req)
+}
+
+func createBuildkiteWebhookWithRetry(ctx context.Context, client *http.Client, wait retryWaitFunc, req *http.Request) (bool, error) {
+	_, _, err := doBuildkiteRequestWithRetry(ctx, client, wait, "Buildkite create webhook", req, http.StatusCreated, http.StatusOK)
+	var responseErr *buildkiteResponseError
+	if errors.As(err, &responseErr) && responseErr.statusCode == http.StatusUnprocessableEntity {
+		return true, nil
+	}
+	return false, err
 }
 
 // --- Buildkite Schedules API ---
