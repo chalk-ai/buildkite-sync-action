@@ -35,6 +35,13 @@ inputs:
       to keep the pipeline's default queue (no agents tag emitted).
     required: false
     default: ''
+  upload-sparse-checkout:
+    description: >
+      Check out only the pipelines directory in the generated "Upload pipeline"
+      bootstrap step (Buildkite agent sparse checkout). The step reads a single
+      file from it, so this saves a full clone per build in large repositories.
+    required: false
+    default: 'false'
 
 # BUILDKITE_API_TOKEN is passed via env: in the calling workflow.
 
@@ -77,5 +84,8 @@ runs:
         fi
         if [[ -n "${{ inputs.upload-queue }}" ]]; then
           ARGS+=(-upload-queue "${{ inputs.upload-queue }}")
+        fi
+        if [[ "${{ inputs.upload-sparse-checkout }}" == "true" ]]; then
+          ARGS+=(-upload-sparse-checkout)
         fi
         "${{ github.action_path }}/sync-tool" "${ARGS[@]}"

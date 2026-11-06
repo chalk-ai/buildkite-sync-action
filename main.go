@@ -200,6 +200,7 @@ type Config struct {
 	PipelinesDir   string
 	PipelinePrefix string
 	UploadQueue    string
+	UploadSparse   bool
 	DryRun         bool
 }
 
@@ -220,6 +221,7 @@ func main() {
 	flag.StringVar(&cfg.TeamUUID, "team-uuid", os.Getenv("BUILDKITE_TEAM_UUID"), "Buildkite team UUID to assign newly created pipelines to")
 	flag.StringVar(&cfg.PipelinePrefix, "prefix", "", "Prefix for pipeline names (e.g. 'chalk-router-')")
 	flag.StringVar(&cfg.UploadQueue, "upload-queue", os.Getenv("BUILDKITE_UPLOAD_QUEUE"), "Agent queue to pin the generated 'Upload pipeline' bootstrap step to (default queue if empty)")
+	flag.BoolVar(&cfg.UploadSparse, "upload-sparse-checkout", os.Getenv("BUILDKITE_UPLOAD_SPARSE_CHECKOUT") == "true", "Check out only the pipelines directory in the generated 'Upload pipeline' bootstrap step")
 	flag.BoolVar(&cfg.DryRun, "dry-run", false, "Print what would be done without making changes")
 
 	var repo, workDir string
@@ -334,7 +336,7 @@ func syncPipeline(ctx context.Context, cfg Config, entry pipelineEntry, existing
 		uploadConcurrency = pf.Builds.Concurrency
 		uploadConcurrencyGroup = pf.Builds.ConcurrencyGroup
 	}
-	bootstrap := bootstrapConfig(cfg.PipelinesDir, filename, fileURL, uploadConcurrency, uploadConcurrencyGroup, cfg.UploadQueue)
+	bootstrap := bootstrapConfig(cfg.PipelinesDir, filename, fileURL, uploadConcurrency, uploadConcurrencyGroup, cfg.UploadQueue, cfg.UploadSparse)
 	pipelineCfg := buildPipelineConfig(pf)
 	branchConfig := buildBranchConfiguration(pf.On)
 
@@ -465,7 +467,13 @@ func discoverPipelines(dir string) ([]pipelineEntry, error) {
 // no meaningful compute. When uploadQueue is set, it's pinned to that (normally the
 // smallest) agent queue instead of floating onto whatever queue the pipeline's default
 // happens to be. Left empty, behavior is unchanged (no agents tag).
-func bootstrapConfig(dir, filename, fileURL string, concurrency int, concurrencyGroup string, uploadQueue string) string {
+//
+// With uploadSparse, the step checks out only the pipelines directory (a cone-mode
+// sparse checkout, so the repository's top-level files come along too): the upload
+// reads one file from it, and a full working tree of a large repository costs
+// hundreds of megabytes per build. Commands in the uploaded steps run on their own
+// agents with their own checkouts, so they are unaffected.
+func bootstrapConfig(dir, filename, fileURL string, concurrency int, concurrencyGroup string, uploadQueue string, uploadSparse bool) string {
 	path := dir + "/" + filename
 	cmd := fmt.Sprintf(
 		`if [ -f %s ]; then buildkite-agent pipeline upload %s; elif [ "${BUILDKITE_PULL_REQUEST}" != "false" ]; then echo "Pipeline file %s not found on this PR branch, skipping."; else echo "Pipeline file %s not found!" && exit 1; fi`,
@@ -475,6 +483,9 @@ func bootstrapConfig(dir, filename, fileURL string, concurrency int, concurrency
 	fmt.Fprintf(&b, "steps:\n  - label: \":pipeline: Upload pipeline — %s\"\n    command: %q\n", fileURL, cmd)
 	if uploadQueue != "" {
 		fmt.Fprintf(&b, "    agents:\n      queue: %q\n", uploadQueue)
+	}
+	if uploadSparse {
+		fmt.Fprintf(&b, "    env:\n      BUILDKITE_GIT_SPARSE_CHECKOUT_PATHS: %q\n", dir)
 	}
 	// Gate the first job on the concurrency group so a newer build's upload stays
 	// queued (scheduled, not running) behind the active build. An un-gated upload
