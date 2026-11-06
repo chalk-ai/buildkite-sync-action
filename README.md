@@ -183,6 +183,7 @@ Pipelines are named `{repo-name}-{filename-without-ext}`. For example, `.buildki
 | `team-uuid` | no | — | Buildkite team UUID to assign newly created pipelines to |
 | `dry-run` | no | `false` | Print planned actions without making changes |
 | `upload-queue` | no | — | Agent queue to pin the generated "Upload pipeline" bootstrap step to (e.g. your smallest queue). Leave unset to keep the pipeline's default queue |
+| `upload-sparse-checkout` | no | `false` | Check out only the pipelines directory in the "Upload pipeline" bootstrap step (agent sparse checkout) |
 
 ## Secrets and variables
 

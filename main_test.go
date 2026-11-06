@@ -255,7 +255,7 @@ func parseBootstrap(t *testing.T, cfg string) map[string]any {
 }
 
 func TestBootstrapConfigUngated(t *testing.T) {
-	cfg := bootstrapConfig(".buildkite", "metaplanner-matrix.yml", "https://example/blob", 0, "", "")
+	cfg := bootstrapConfig(".buildkite", "metaplanner-matrix.yml", "https://example/blob", 0, "", "", false)
 	step := parseBootstrap(t, cfg)
 
 	if _, ok := step["concurrency"]; ok {
@@ -273,7 +273,7 @@ func TestBootstrapConfigUngated(t *testing.T) {
 }
 
 func TestBootstrapConfigGated(t *testing.T) {
-	cfg := bootstrapConfig(".buildkite", "metaplanner-matrix.yml", "https://example/blob", 1, "metaplanner-matrix/chalk-q-staging", "")
+	cfg := bootstrapConfig(".buildkite", "metaplanner-matrix.yml", "https://example/blob", 1, "metaplanner-matrix/chalk-q-staging", "", false)
 	step := parseBootstrap(t, cfg)
 
 	if got := step["concurrency"]; got != 1 {
@@ -287,7 +287,7 @@ func TestBootstrapConfigGated(t *testing.T) {
 // TestBootstrapConfigGroupDefaultsConcurrency verifies a group with an unset or
 // non-positive concurrency defaults to 1 rather than emitting an invalid 0.
 func TestBootstrapConfigGroupDefaultsConcurrency(t *testing.T) {
-	cfg := bootstrapConfig(".buildkite", "p.yml", "https://example/blob", 0, "grp", "")
+	cfg := bootstrapConfig(".buildkite", "p.yml", "https://example/blob", 0, "grp", "", false)
 	step := parseBootstrap(t, cfg)
 
 	if got := step["concurrency"]; got != 1 {
@@ -298,7 +298,7 @@ func TestBootstrapConfigGroupDefaultsConcurrency(t *testing.T) {
 // TestBootstrapConfigUploadQueue verifies the upload step is pinned to the given
 // agent queue when uploadQueue is set.
 func TestBootstrapConfigUploadQueue(t *testing.T) {
-	cfg := bootstrapConfig(".buildkite", "metaplanner-matrix.yml", "https://example/blob", 0, "", "small-job-queue")
+	cfg := bootstrapConfig(".buildkite", "metaplanner-matrix.yml", "https://example/blob", 0, "", "small-job-queue", false)
 	step := parseBootstrap(t, cfg)
 
 	agents, ok := step["agents"].(map[string]any)
@@ -504,5 +504,25 @@ on:
 	}
 	if len(s.Env) != 0 {
 		t.Errorf("Env = %v, want empty", s.Env)
+	}
+}
+
+// TestBootstrapConfigUploadSparse verifies the upload step asks for a sparse
+// checkout of the pipelines directory only when enabled.
+func TestBootstrapConfigUploadSparse(t *testing.T) {
+	cfg := bootstrapConfig(".buildkite", "bazel.yml", "https://example/blob", 0, "", "small-job-queue", true)
+	step := parseBootstrap(t, cfg)
+
+	env, ok := step["env"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected env to be set:\n%s", cfg)
+	}
+	if got := env["BUILDKITE_GIT_SPARSE_CHECKOUT_PATHS"]; got != ".buildkite" {
+		t.Errorf("BUILDKITE_GIT_SPARSE_CHECKOUT_PATHS = %v, want .buildkite:\n%s", got, cfg)
+	}
+
+	plain := parseBootstrap(t, bootstrapConfig(".buildkite", "bazel.yml", "https://example/blob", 0, "", "", false))
+	if _, ok := plain["env"]; ok {
+		t.Errorf("env set without uploadSparse")
 	}
 }
