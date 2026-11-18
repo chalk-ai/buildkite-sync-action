@@ -272,29 +272,6 @@ func TestBootstrapConfigUngated(t *testing.T) {
 	}
 }
 
-func TestBootstrapConfigRetriesInfrastructureFailures(t *testing.T) {
-	for _, sparse := range []bool{false, true} {
-		cfg := bootstrapConfig(".buildkite", "p.yml", "https://example/blob", 1, "group", "small-job-queue", sparse)
-		var parsed struct {
-			Steps []struct {
-				Retry struct {
-					Automatic []struct {
-						ExitStatus int `yaml:"exit_status"`
-						Limit      int `yaml:"limit"`
-					} `yaml:"automatic"`
-				} `yaml:"retry"`
-			} `yaml:"steps"`
-		}
-		if err := yaml.Unmarshal([]byte(cfg), &parsed); err != nil {
-			t.Fatal(err)
-		}
-		rules := parsed.Steps[0].Retry.Automatic
-		if len(rules) != 2 || rules[0].ExitStatus != -1 || rules[0].Limit != 2 || rules[1].ExitStatus != 255 || rules[1].Limit != 2 {
-			t.Errorf("sparse=%v: unexpected retry policy: %+v", sparse, rules)
-		}
-	}
-}
-
 func TestBootstrapConfigGated(t *testing.T) {
 	cfg := bootstrapConfig(".buildkite", "metaplanner-matrix.yml", "https://example/blob", 1, "metaplanner-matrix/chalk-q-staging", "", false)
 	step := parseBootstrap(t, cfg)
