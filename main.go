@@ -481,6 +481,7 @@ func bootstrapConfig(dir, filename, fileURL string, concurrency int, concurrency
 	)
 	var b strings.Builder
 	fmt.Fprintf(&b, "steps:\n  - label: \":pipeline: Upload pipeline — %s\"\n    command: %q\n", fileURL, cmd)
+	b.WriteString("    retry:\n      automatic:\n        - exit_status: -1\n          limit: 2\n        - exit_status: 255\n          limit: 2\n")
 	if uploadQueue != "" {
 		fmt.Fprintf(&b, "    agents:\n      queue: %q\n", uploadQueue)
 	}
